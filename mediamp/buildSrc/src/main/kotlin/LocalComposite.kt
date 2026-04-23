@@ -9,6 +9,12 @@ fun Project.isLocalCompositeMediamp(): Boolean =
         .orElse(false)
         .get()
 
+fun Project.isMediampNativeBuildEnabled(): Boolean =
+    providers.gradleProperty("mediamp.nativeBuild")
+        .map { it.toBooleanStrictOrNull() ?: false }
+        .orElse(false)
+        .get()
+
 fun KotlinMultiplatformExtension.configureAndroidNamespaceIfPresent(namespace: String) {
     val androidExtension = extensions.findByName("android") ?: return
     androidExtension::class.java.methods

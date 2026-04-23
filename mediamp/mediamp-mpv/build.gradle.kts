@@ -11,6 +11,7 @@
 import mpv.configureMediampMpvModule
 import localcomposite.configureAndroidNamespaceIfPresent
 import localcomposite.isLocalCompositeMediamp
+import localcomposite.isMediampNativeBuildEnabled
 import org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi
 
 plugins {
@@ -22,6 +23,7 @@ plugins {
 
 description = "MediaMP backend using MPV"
 val isLocalComposite = isLocalCompositeMediamp()
+val nativeBuildEnabled = !isLocalComposite || isMediampNativeBuildEnabled()
 
 if (!isLocalComposite) {
     apply(plugin = "com.android.kotlin.multiplatform.library")
@@ -57,7 +59,7 @@ kotlin {
     }
 }
 
-if (!isLocalComposite) {
+if (nativeBuildEnabled) {
     configureMediampMpvModule()
     val hostMpvTargetName = when (getOs()) {
         Os.Windows -> "WindowsX64"
@@ -121,7 +123,9 @@ if (!isLocalComposite) {
         dependsOn(copyNativeJarForCurrentPlatform)
     }
 
-    apply(from = rootProject.file("gradle/publishing/mediamp-mpv-publishing.gradle.kts"))
+    if (!isLocalComposite) {
+        apply(from = rootProject.file("gradle/publishing/mediamp-mpv-publishing.gradle.kts"))
+    }
 
     val cleanNativeBuild = tasks.register("cleanNativeBuild", Delete::class.java) {
         group = "mediamp"

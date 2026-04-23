@@ -9,6 +9,7 @@
 import ffmpeg.configureMediampFfmpegModule
 import localcomposite.configureAndroidNamespaceIfPresent
 import localcomposite.isLocalCompositeMediamp
+import localcomposite.isMediampNativeBuildEnabled
 import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 
 plugins {
@@ -19,6 +20,7 @@ plugins {
 
 description = "FFmpeg binary wrapper for MediaMP"
 val isLocalComposite = isLocalCompositeMediamp()
+val nativeBuildEnabled = !isLocalComposite || isMediampNativeBuildEnabled()
 
 if (!isLocalComposite) {
     apply(plugin = "com.android.kotlin.multiplatform.library")
@@ -38,11 +40,14 @@ kotlin {
     }
 }
 
-if (!isLocalComposite) {
-    apply(from = rootProject.file("gradle/publishing/mediamp-ffmpeg-publishing.gradle.kts"))
+if (nativeBuildEnabled) {
+    if (!isLocalComposite) {
+        apply(from = rootProject.file("gradle/publishing/mediamp-ffmpeg-publishing.gradle.kts"))
+    }
     configureMediampFfmpegModule()
 
-    kotlin {
+    if (!isLocalComposite) {
+        kotlin {
         targets.withType(KotlinNativeTarget::class.java)
             .matching { target -> target.name == "iosArm64" || target.name == "iosSimulatorArm64" }
             .configureEach {
@@ -71,5 +76,6 @@ if (!isLocalComposite) {
                     }
                 }
             }
+        }
     }
 }

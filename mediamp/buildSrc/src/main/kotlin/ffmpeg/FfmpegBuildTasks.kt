@@ -25,73 +25,66 @@ internal fun registerHostFfmpegTasks(context: FfmpegBuildContext) {
     val project = context.project
     val sourceTemplateDir = project.layout.buildDirectory.dir("ffmpeg-source-template")
 
-    val applyPatchesTask = project.tasks.register<Exec>("applyFfmpegPatches") {
-        group = "ffmpeg"
-        description = "Apply patches to the FFmpeg submodule source tree"
-        enabled = context.ffmpegPatch.exists()
-        
-        commandLine("git", "apply", context.ffmpegPatch.absolutePath)
-        workingDir = context.ffmpegSrcDir
-    }
-
-    val revertPatchesTask = project.tasks.register<Exec>("revertFfmpegPatches") {
-        group = "ffmpeg"
-        description = "Revert patches from the FFmpeg submodule source tree"
-        enabled = context.ffmpegPatch.exists()
-        
-        commandLine("git", "checkout", "--", ".")
-        workingDir = context.ffmpegSrcDir
-    }
-
     val sourceTemplateTask = project.tasks.register<PrepareSourceTreeTask>("prepareFfmpegSourceTemplate") {
         group = "ffmpeg"
         description = "Create a stable FFmpeg source snapshot for this build"
-        dependsOn(applyPatchesTask)
-        finalizedBy(revertPatchesTask)
         sourceDir.set(context.ffmpegSrcDir)
         outputDir.set(sourceTemplateDir)
         markerFileRelativePath.set("configure")
         sourceDisplayName.set("FFmpeg")
         preserveExecutablePermissions.set(true)
     }
+
+    val patchedSourceTemplateTask: TaskProvider<out Task> = if (context.ffmpegPatch.exists()) {
+        project.tasks.register<Exec>("patchFfmpegSourceTemplate") {
+            group = "ffmpeg"
+            description = "Apply vendored FFmpeg patches to the prepared build source tree"
+            dependsOn(sourceTemplateTask)
+
+            commandLine("git", "apply", context.ffmpegPatch.absolutePath)
+            workingDir = sourceTemplateDir.get().asFile
+        }
+    } else {
+        sourceTemplateTask
+    }
     var previousTargetTask: TaskProvider<out Task>? = null
     when (context.hostOs) {
         Os.Windows -> {
             if (context.isBuildVariantEnabled("windows")) {
-                previousTargetTask = registerFfmpegTasks(context, context.windowsTarget(), sourceTemplateTask, sourceTemplateDir, previousTargetTask)
+                previousTargetTask = registerFfmpegTasks(context, context.windowsTarget(), patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
             } else {
                 project.logger.lifecycle("Skipping FFmpeg windows targets: mediamp.ffmpeg.buildvariant does not include 'windows'.")
             }
-            previousTargetTask = registerAndroidTargetsIfAvailable(context, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
+            previousTargetTask = registerAndroidTargetsIfAvailable(context, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
         }
 
         Os.Linux -> {
             if (context.isBuildVariantEnabled("linux")) {
-                previousTargetTask = registerFfmpegTasks(context, context.linuxX64Target, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
+                previousTargetTask = registerFfmpegTasks(context, context.linuxX64Target, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
             } else {
                 project.logger.lifecycle("Skipping FFmpeg linux targets: mediamp.ffmpeg.buildvariant does not include 'linux'.")
             }
-            previousTargetTask = registerAndroidTargetsIfAvailable(context, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
+            previousTargetTask = registerAndroidTargetsIfAvailable(context, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
         }
 
         Os.MacOS -> {
             if (context.isBuildVariantEnabled("macos")) {
                 when (context.hostArch) {
-                    Arch.AARCH64 -> previousTargetTask = registerFfmpegTasks(context, context.macosArm64Target, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
-                    Arch.X86_64 -> previousTargetTask = registerFfmpegTasks(context, context.macosX64Target, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
+                    Arch.AARCH64 -> previousTargetTask = registerFfmpegTasks(context, context.macosArm64Target, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
+                    Arch.X86_64 -> previousTargetTask = registerFfmpegTasks(context, context.macosX64Target, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
                     else -> throw GradleException("Failed to configure FFmpeg tasks, unknown macOS host.")
                 }
             } else {
                 project.logger.lifecycle("Skipping FFmpeg macos targets: mediamp.ffmpeg.buildvariant does not include 'macos'.")
             }
             if (context.isBuildVariantEnabled("ios")) {
-                previousTargetTask = registerFfmpegTasks(context, context.iosArm64Target, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
-                previousTargetTask = registerFfmpegTasks(context, context.iosSimulatorArm64Target, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
+                previousTargetTask = registerFfmpegTasks(context, context.iosArm64Target, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
+                previousTargetTask = registerFfmpegTasks(context, context.iosSimulatorArm64Target, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
                 registerAppleXcframeworkTask(context)
             } else {
                 project.logger.lifecycle("Skipping FFmpeg ios targets: mediamp.ffmpeg.buildvariant does not include 'ios'.")
             }
-            previousTargetTask = registerAndroidTargetsIfAvailable(context, sourceTemplateTask, sourceTemplateDir, previousTargetTask)
+            previousTargetTask = registerAndroidTargetsIfAvailable(context, patchedSourceTemplateTask, sourceTemplateDir, previousTargetTask)
         }
 
         Os.Unknown -> project.logger.warn("Unknown host OS – no FFmpeg build targets registered.")
@@ -124,7 +117,7 @@ internal fun FfmpegBuildContext.windowsTarget(): FfmpegBuildTarget = FfmpegBuild
 
 private fun registerAndroidTargetsIfAvailable(
     context: FfmpegBuildContext,
-    sourceTemplateTask: TaskProvider<PrepareSourceTreeTask>,
+    sourceTemplateTask: TaskProvider<out Task>,
     templateSnapshotDir: org.gradle.api.provider.Provider<org.gradle.api.file.Directory>,
     previousTargetTask: TaskProvider<out Task>?,
 ): TaskProvider<out Task>? {
@@ -149,7 +142,7 @@ private fun registerAndroidTargetsIfAvailable(
 private fun registerFfmpegTasks(
     context: FfmpegBuildContext,
     target: FfmpegBuildTarget,
-    sourceTemplateTask: TaskProvider<PrepareSourceTreeTask>,
+    sourceTemplateTask: TaskProvider<out Task>,
     templateSnapshotDir: org.gradle.api.provider.Provider<org.gradle.api.file.Directory>,
     previousTargetTask: TaskProvider<out Task>?,
 ): TaskProvider<out Task> {

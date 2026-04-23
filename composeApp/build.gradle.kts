@@ -199,6 +199,46 @@ abstract class PrepareWindowsRuntimeTask : DefaultTask() {
     }
 }
 
+abstract class SyncVendoredWindowsRuntimeTask : DefaultTask() {
+    @get:Internal
+    abstract val sourceDir: DirectoryProperty
+
+    @get:Input
+    abstract val sourceDirPath: Property<String>
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @get:Inject
+    abstract val fileSystemOperations: FileSystemOperations
+
+    @TaskAction
+    fun sync() {
+        val sourceDirectory = sourceDir.get().asFile
+        if (!sourceDirectory.isDirectory) {
+            return
+        }
+
+        val runtimeJars = sourceDirectory.listFiles()
+            ?.filter { file ->
+                file.isFile &&
+                    file.extension.equals("jar", ignoreCase = true) &&
+                    Regex("""^mediamp-mpv-runtime-.*-windows-x64\.jar$""").matches(file.name)
+            }
+            ?.sortedBy(File::getName)
+            .orEmpty()
+
+        if (runtimeJars.isEmpty()) {
+            return
+        }
+
+        fileSystemOperations.copy {
+            from(runtimeJars)
+            into(outputDir)
+        }
+    }
+}
+
 plugins {
     alias(libs.plugins.kotlinMultiplatform)
     alias(libs.plugins.androidApplication)
@@ -241,6 +281,10 @@ val fullCommonSourceDir = project.file("src/fullCommonMain/kotlin")
 val generatedRuntimeConfigDir = layout.buildDirectory.dir("generated/runtime-config/kotlin")
 val windowsRuntimeInputDir = resolveWindowsRuntimeInputDir(project)
 val preparedWindowsRuntimeDir = layout.buildDirectory.dir("vendor-runtime/windows-x64")
+val generatedMediampWindowsRuntimeDir = rootProject.layout.projectDirectory.dir("mediamp/mediamp-mpv/build/libs")
+val desktopProguardEnabled = providers.gradleProperty("nuvio.desktop.proguard")
+    .map { it.equals("true", ignoreCase = true) }
+    .orElse(false)
 val java21Launcher = javaToolchains.launcherFor {
     languageVersion.set(JavaLanguageVersion.of(21))
 }
@@ -265,6 +309,18 @@ val prepareWindowsRuntime = tasks.register<PrepareWindowsRuntimeTask>("prepareWi
     outputDir.set(preparedWindowsRuntimeDir)
 }
 
+val syncVendoredWindowsRuntime = tasks.register<SyncVendoredWindowsRuntimeTask>("syncVendoredWindowsRuntime") {
+    group = "distribution"
+    description = "Copy generated Windows runtime JARs from vendored mediamp into composeApp/vendor-runtime/windows-x64."
+    sourceDir.set(generatedMediampWindowsRuntimeDir)
+    sourceDirPath.set(generatedMediampWindowsRuntimeDir.asFile.absolutePath)
+    outputDir.set(layout.projectDirectory.dir("vendor-runtime/windows-x64"))
+}
+
+prepareWindowsRuntime.configure {
+    dependsOn(syncVendoredWindowsRuntime)
+}
+
 tasks.withType<KotlinCompilationTask<*>>().configureEach {
     dependsOn(generateRuntimeConfigs)
 }
@@ -286,6 +342,7 @@ tasks.matching {
         "packageReleaseDistributionForCurrentOS",
         "packageExe",
         "packageReleaseExe",
+        "proguardReleaseJars",
     )
 }.configureEach {
     dependsOn(prepareWindowsRuntime)
@@ -430,7 +487,10 @@ compose.desktop {
         mainClass = "com.nuvio.app.DesktopAppKt"
 
         buildTypes.release.proguard {
-            configurationFiles.from(project.file("desktop-proguard-rules.pro"))
+            isEnabled.set(desktopProguardEnabled)
+            if (desktopProguardEnabled.get()) {
+                configurationFiles.from(project.file("desktop-proguard-rules.pro"))
+            }
         }
         nativeDistributions {
             packageName = "Nuvio"
