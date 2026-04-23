@@ -8,14 +8,19 @@
 
 package org.openani.mediamp.mpv
 
-// import com.sun.jna.platform.win32.Kernel32
+import com.sun.jna.NativeLibrary
+import com.sun.jna.WString
 import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.nio.file.StandardOpenOption
 import java.util.Locale
 
 internal actual object LibraryLoader {
     private const val cacheDirPropertyName = "mediamp.cache.dir"
+    private const val logFilePropertyName = "mediamp.log.file"
     private val osName: String = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT)
     private val extractionLock = Any()
     private val loadLock = Any()
@@ -27,7 +32,6 @@ internal actual object LibraryLoader {
 
     actual fun loadLibraries(context: Any?) {
         val runtimeDir = ensureExtracted()
-        // registerWindowsDllDirectory(runtimeDir)
         ensureRuntimeLoaded(runtimeDir)
     }
 
@@ -46,30 +50,54 @@ internal actual object LibraryLoader {
         synchronized(loadLock) {
             val key = canonicalDir.absolutePath
             if (key in loadedRuntimeDirs) return
-            runtimeLibrariesInLoadOrder(canonicalDir).forEach { library ->
-                System.load(library.absolutePath)
+
+            val runtimeLibraries = runtimeLibrariesInLoadOrder(canonicalDir)
+            configureWindowsDllSearchPath(canonicalDir)
+            appendDiagnostic(
+                "Loading mediamp runtime from ${canonicalDir.absolutePath} with libraries: " +
+                    runtimeLibraries.joinToString(", ") { it.name },
+            )
+
+            try {
+                if (osName.contains("win")) {
+                    loadWindowsLibraries(runtimeLibraries)
+                } else {
+                    runtimeLibraries.forEach { library ->
+                        System.load(library.absolutePath)
+                    }
+                }
+            } catch (throwable: Throwable) {
+                appendDiagnostic("Failed to load mediamp runtime from ${canonicalDir.absolutePath}", throwable)
+                throw throwable
             }
+
             loadedRuntimeDirs += key
         }
     }
 
-    // private fun registerWindowsDllDirectory(dir: File) {
-    //     if (!osName.contains("win")) return
-    //     if (!dir.exists() || !dir.isDirectory) return
+    private fun configureWindowsDllSearchPath(runtimeDir: File) {
+    if (!osName.contains("win")) return
 
-    //     runCatching {
-    //         val ok = Kernel32.INSTANCE.SetDllDirectory(dir.absolutePath)
-    //         if (!ok) {
-    //             val error = Kernel32.INSTANCE.GetLastError()
-    //             println("mediamp-mpv: SetDllDirectory failed for '${dir.absolutePath}', error=$error")
-    //         } else {
-    //             println("mediamp-mpv: registered DLL directory '${dir.absolutePath}'")
-    //         }
-    //     }.onFailure { t ->
-    //         println("mediamp-mpv: failed to register DLL directory '${dir.absolutePath}': ${t.message}")
-    //         t.printStackTrace()
-    //     }
-    // }
+    runCatching {
+        val kernel32 = NativeLibrary.getInstance("kernel32")
+        val setDllDirectoryW = kernel32.getFunction("SetDllDirectoryW")
+        val result = setDllDirectoryW.invokeInt(arrayOf(WString(runtimeDir.absolutePath)))
+
+        appendDiagnostic(
+            "Configured Windows DLL search path to ${runtimeDir.absolutePath}; success=${result != 0}",
+        )
+
+        check(result != 0) {
+            "Failed to configure Windows DLL search path for ${runtimeDir.absolutePath}"
+        }
+    }.onFailure { throwable ->
+        appendDiagnostic(
+            "Failed to configure Windows DLL search path for ${runtimeDir.absolutePath}",
+            throwable,
+        )
+        throw throwable
+    }
+}
 
     private fun extractNativeBinaries(): File {
         val dir = resolveExtractionDirectory()
@@ -98,6 +126,15 @@ internal actual object LibraryLoader {
                 target.setExecutable(true, false)
             }
         }
+
+        appendDiagnostic(
+            "Extracted mediamp runtime to ${dir.absolutePath}; files=" +
+                dir.listFiles()
+                    ?.sortedBy(File::getName)
+                    ?.joinToString(", ") { it.name }
+                    .orEmpty(),
+        )
+
         return dir
     }
 
@@ -158,11 +195,26 @@ internal actual object LibraryLoader {
             "libplacebo",
         )
 
+        val windowsPreludeLibraries = if (osName.contains("win")) {
+            listOf(
+                "libwinpthread-1.dll",
+                "libgcc_s_seh-1.dll",
+                "libstdc++-6.dll",
+            ).mapNotNull { expectedName ->
+                allSharedLibraries.firstOrNull { it.name.equals(expectedName, ignoreCase = true) }
+            }
+        } else {
+            emptyList()
+        }
+
         return buildList {
+            addAll(windowsPreludeLibraries)
+
             if (osName.contains("win")) {
                 allSharedLibraries
                     .filterNot { candidate ->
-                        ffmpegPrefixes.any(candidate.name::startsWith) ||
+                        windowsPreludeLibraries.any { it.absolutePath == candidate.absolutePath } ||
+                            ffmpegPrefixes.any(candidate.name::startsWith) ||
                             mpvPrefixes.any(candidate.name::startsWith)
                     }
                     .sortedByDescending(File::getName)
@@ -170,7 +222,8 @@ internal actual object LibraryLoader {
             } else {
                 allSharedLibraries
                     .filterNot { candidate ->
-                        ffmpegPrefixes.any(candidate.name::startsWith) ||
+                        windowsPreludeLibraries.any { it.absolutePath == candidate.absolutePath } ||
+                            ffmpegPrefixes.any(candidate.name::startsWith) ||
                             mpvPrefixes.any(candidate.name::startsWith)
                     }
                     .sortedBy(File::getName)
@@ -200,12 +253,75 @@ internal actual object LibraryLoader {
         }
     }
 
+    private fun loadWindowsLibraries(runtimeLibraries: List<File>) {
+        val pending = runtimeLibraries.toMutableList()
+        val failuresByLibrary = linkedMapOf<String, Throwable>()
+
+        while (pending.isNotEmpty()) {
+            var loadedAny = false
+            val iterator = pending.iterator()
+
+            while (iterator.hasNext()) {
+                val library = iterator.next()
+                try {
+                    System.load(library.absolutePath)
+                    iterator.remove()
+                    failuresByLibrary.remove(library.name)
+                    appendDiagnostic("Loaded Windows runtime library ${library.name}")
+                    loadedAny = true
+                } catch (throwable: Throwable) {
+                    failuresByLibrary[library.name] = throwable
+                }
+            }
+
+            if (loadedAny) continue
+
+            val pendingSummary = pending.joinToString("; ") { library ->
+                val failureMessage = failuresByLibrary[library.name]?.message ?: "unknown error"
+                "${library.name}: $failureMessage"
+            }
+            val primaryFailure = failuresByLibrary[pending.first().name]
+            throw IllegalStateException(
+                "Failed to resolve Windows mediamp runtime dependency closure. Pending libraries: $pendingSummary",
+                primaryFailure,
+            )
+        }
+    }
+
     private fun wrapperLibraryName(): String =
         when {
             osName.contains("win") -> "mediampv.dll"
             osName.contains("mac") -> "libmediampv.dylib"
             else -> "libmediampv.so"
         }
+
+    private fun appendDiagnostic(message: String, throwable: Throwable? = null) {
+        val logFile = System.getProperty(logFilePropertyName)
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::File)
+            ?: return
+
+        runCatching {
+            logFile.parentFile?.mkdirs()
+            val payload = buildString {
+                append("[mediamp] ")
+                append(message)
+                append('\n')
+                if (throwable != null) {
+                    val traceWriter = StringWriter()
+                    throwable.printStackTrace(PrintWriter(traceWriter))
+                    append(traceWriter)
+                    append('\n')
+                }
+            }
+            Files.writeString(
+                logFile.toPath(),
+                payload,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.APPEND,
+            )
+        }
+    }
 }
 
 private fun File.isSharedRuntimeLibrary(osName: String): Boolean =

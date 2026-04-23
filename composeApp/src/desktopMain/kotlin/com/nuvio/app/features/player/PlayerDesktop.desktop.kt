@@ -38,8 +38,12 @@ import com.nuvio.app.features.streams.StreamItem
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import java.awt.Canvas
+import java.awt.Graphics
 import java.awt.event.HierarchyEvent
 import java.awt.event.HierarchyListener
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
+import javax.swing.SwingUtilities
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -500,7 +504,12 @@ private fun WindowsMpvPlayerSurface(
     val currentOnControllerReady by rememberUpdatedState(onControllerReady)
     val currentOnSnapshot by rememberUpdatedState(onSnapshot)
     val currentOnError by rememberUpdatedState(onError)
+
     var fatalErrorMessage by remember { mutableStateOf<String?>(null) }
+    var surfaceAttached by remember { mutableStateOf(false) }
+    var attachAttempted by remember { mutableStateOf(false) }
+    var sessionClosed by remember { mutableStateOf(false) }
+
     val sessionResult = remember {
         runCatching {
             val player = MpvMediampPlayer(Unit, kotlin.coroutines.EmptyCoroutineContext)
@@ -509,8 +518,18 @@ private fun WindowsMpvPlayerSurface(
             WindowsMpvSession(
                 player = player,
                 handle = handle,
-                renderSurface = Canvas().apply {
+                // We must NOT let AWT paint over the HWND: mpv renders with D3D11
+                // directly to the native window, and any GDI paint() or update()
+                // call from AWT will blank the D3D11 swap chain. We therefore
+                // ignore all repaint events and make paint()/update() no-ops so
+                // mpv owns the rendering of this window.
+                renderSurface = object : Canvas() {
+                    override fun paint(g: Graphics?) { /* mpv owns this surface */ }
+                    override fun update(g: Graphics?) { /* mpv owns this surface */ }
+                }.apply {
                     background = java.awt.Color.BLACK
+                    isFocusable = false
+                    ignoreRepaint = true
                 },
             )
         }
@@ -530,6 +549,17 @@ private fun WindowsMpvPlayerSurface(
             message = "Windows mediamp/mpv failure during $phase; switching to controlled error UI.",
             throwable = throwable,
         )
+
+        surfaceAttached = false
+
+        if (!sessionClosed) {
+            sessionResult.getOrNull()?.let { session ->
+                runCatching { detachMpvRenderSurface(session.handle) }
+                runCatching { session.player.close() }
+            }
+            sessionClosed = true
+        }
+
         fatalErrorMessage = message
         currentOnError(message)
     }
@@ -552,7 +582,7 @@ private fun WindowsMpvPlayerSurface(
     }
 
     val session = sessionResult.getOrNull()
-    if (session == null || fatalErrorMessage != null) {
+    if (session == null || fatalErrorMessage != null || sessionClosed) {
         Box(
             modifier = modifier
                 .fillMaxSize()
@@ -567,61 +597,174 @@ private fun WindowsMpvPlayerSurface(
 
     DisposableEffect(player, renderSurface) {
         val hierarchyListener = HierarchyListener { event ->
-            val displayabilityChanged =
-                event.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong() != 0L
-            if (displayabilityChanged && renderSurface.isDisplayable) {
-                runCatching { attachMpvRenderSurfaceOrThrow(handle, renderSurface) }
-                    .onFailure { error -> reportFatalFailure("render-surface attach", error) }
+            val changed = event.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong() != 0L
+            if (changed) {
+                SwingUtilities.invokeLater {
+                    renderSurface.repaint()
+                }
+            }
+        }
+
+        val componentListener = object : ComponentAdapter() {
+            override fun componentShown(e: ComponentEvent?) {
+                renderSurface.repaint()
+            }
+
+            override fun componentResized(e: ComponentEvent?) {
+                renderSurface.repaint()
             }
         }
 
         renderSurface.addHierarchyListener(hierarchyListener)
-        if (renderSurface.isDisplayable) {
-            runCatching { attachMpvRenderSurfaceOrThrow(handle, renderSurface) }
-                .onFailure { error -> reportFatalFailure("render-surface attach", error) }
-        }
+        renderSurface.addComponentListener(componentListener)
 
         onDispose {
+            sessionClosed = true
+            surfaceAttached = false
             renderSurface.removeHierarchyListener(hierarchyListener)
+            renderSurface.removeComponentListener(componentListener)
             runCatching { detachMpvRenderSurface(handle) }
-            player.close()
+            runCatching { player.close() }
         }
     }
 
-    // Load source
-    LaunchedEffect(sourceUrl, sourceAudioUrl) {
+    LaunchedEffect(renderSurface, handle, fatalErrorMessage) {
+        if (fatalErrorMessage != null) return@LaunchedEffect
+        if (sessionClosed) return@LaunchedEffect
+        if (attachAttempted) return@LaunchedEffect
+
+        attachAttempted = true
+
         try {
+            attachMpvRenderSurfaceOrThrow(handle, renderSurface)
+            surfaceAttached = true
             DesktopRuntimeDiagnostics.info(
                 tag = "PlayerDesktop",
-                message = "Initializing mediamp/mpv playback path.",
+                message = "MPV render surface attached successfully.",
             )
-            val headers = sourceHeaders.toMutableMap()
-            player.setMediaData(UriMediaData(sourceUrl, headers))
+        } catch (e: Throwable) {
+            reportFatalFailure("render-surface attach", e)
+        }
+    }
 
-            // Attach separate audio track if provided
-            if (!sourceAudioUrl.isNullOrEmpty()) {
-                handle.command("audio-add", sourceAudioUrl, "auto")
-            }
+    LaunchedEffect(sourceUrl, sourceAudioUrl, surfaceAttached, fatalErrorMessage, sessionClosed) {
+        if (!surfaceAttached || fatalErrorMessage != null || sessionClosed) return@LaunchedEffect
 
-            if (playWhenReady) {
-                player.resume()
+        try {
+            withContext(Dispatchers.IO) {
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "Initializing mediamp/mpv playback path.",
+                )
+
+                val headers = sourceHeaders.toMutableMap()
+
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "Calling player.setMediaData(...)",
+                )
+                player.setMediaData(UriMediaData(sourceUrl, headers))
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "player.setMediaData(...) returned",
+                )
+
+                if (!sourceAudioUrl.isNullOrEmpty()) {
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "Calling audio-add for external audio track.",
+                    )
+                    handle.command("audio-add", sourceAudioUrl, "auto")
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "audio-add returned",
+                    )
+                }
+
+                if (playWhenReady) {
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "Calling player.resume()",
+                    )
+                    player.resume()
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "player.resume() returned",
+                    )
+                } else {
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "Skipping auto-resume because playWhenReady=false",
+                    )
+                }
+
+                // Wait briefly for mpv to settle, then dump the rendering state.
+                // This tells us whether the VO is configured against our HWND,
+                // whether a video track is recognized, and whether decoding has
+                // actually started. All reads are guarded: if mpv refuses a
+                // property we just log empty, never throw.
+                kotlinx.coroutines.delay(1500)
+                fun readProp(name: String): String = runCatching {
+                    handle.getPropertyString(name)
+                }.getOrElse { it.message ?: "<error>" }
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "mpv state dump: " +
+                        "wid=${readProp("wid")}, " +
+                        "vo=${readProp("vo")}, " +
+                        "current-vo=${readProp("current-vo")}, " +
+                        "gpu-context=${readProp("gpu-context")}, " +
+                        "width=${readProp("width")}, " +
+                        "height=${readProp("height")}, " +
+                        "dwidth=${readProp("dwidth")}, " +
+                        "dheight=${readProp("dheight")}, " +
+                        "video-codec=${readProp("video-codec")}, " +
+                        "hwdec-current=${readProp("hwdec-current")}, " +
+                        "pause=${readProp("pause")}, " +
+                        "core-idle=${readProp("core-idle")}, " +
+                        "idle-active=${readProp("idle-active")}, " +
+                        "eof-reached=${readProp("eof-reached")}, " +
+                        "mpv-version=${readProp("mpv-version")}",
+                )
             }
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             reportFatalFailure("media load", e)
         }
     }
 
-    // Handle play/pause changes
-    LaunchedEffect(playWhenReady) {
-        if (playWhenReady && player.getCurrentPlaybackState() == PlaybackState.PAUSED) {
-            player.resume()
-        } else if (!playWhenReady && player.getCurrentPlaybackState() == PlaybackState.PLAYING) {
-            player.pause()
+    LaunchedEffect(playWhenReady, surfaceAttached, fatalErrorMessage, sessionClosed) {
+        if (!surfaceAttached || fatalErrorMessage != null || sessionClosed) return@LaunchedEffect
+
+        runCatching {
+            withContext(Dispatchers.IO) {
+                val state = player.getCurrentPlaybackState()
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "Applying playWhenReady=$playWhenReady on state=$state",
+                )
+
+                if (playWhenReady && (state == PlaybackState.PAUSED || state == PlaybackState.PAUSED_BUFFERING)) {
+                    player.resume()
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "player.resume() from toggle returned",
+                    )
+                } else if (!playWhenReady && state == PlaybackState.PLAYING) {
+                    player.pause()
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "player.pause() from toggle returned",
+                    )
+                }
+            }
+        }.onFailure {
+            reportFatalFailure("playback toggle", it)
         }
     }
 
-    // Handle resize mode
-    LaunchedEffect(resizeMode) {
+    LaunchedEffect(resizeMode, surfaceAttached, fatalErrorMessage, sessionClosed) {
+        if (!surfaceAttached || fatalErrorMessage != null || sessionClosed) return@LaunchedEffect
+
         when (resizeMode) {
             PlayerResizeMode.Fit -> {
                 handle.setProperty("panscan", 0.0)
@@ -634,17 +777,21 @@ private fun WindowsMpvPlayerSurface(
         }
     }
 
-    // Create controller
     val controller = remember(player) {
         WindowsMpvController(player, handle)
     }
 
-    LaunchedEffect(controller) {
+    LaunchedEffect(controller, surfaceAttached, fatalErrorMessage, sessionClosed) {
+        if (!surfaceAttached || fatalErrorMessage != null || sessionClosed) {
+            currentOnControllerReady(NoOpPlayerEngineController)
+            return@LaunchedEffect
+        }
         currentOnControllerReady(controller)
     }
 
-    // Collect playback state and report snapshots
-    LaunchedEffect(player) {
+    LaunchedEffect(player, surfaceAttached, fatalErrorMessage, sessionClosed) {
+        if (!surfaceAttached || fatalErrorMessage != null || sessionClosed) return@LaunchedEffect
+
         combine(
             player.playbackState,
             player.currentPositionMillis,
@@ -664,8 +811,9 @@ private fun WindowsMpvPlayerSurface(
         }
     }
 
-    // Detect errors
-    LaunchedEffect(player) {
+    LaunchedEffect(player, surfaceAttached, fatalErrorMessage, sessionClosed) {
+        if (!surfaceAttached || fatalErrorMessage != null || sessionClosed) return@LaunchedEffect
+
         player.playbackState.collectLatest { state ->
             if (state == PlaybackState.ERROR) {
                 DesktopRuntimeDiagnostics.warn(
@@ -684,10 +832,6 @@ private fun WindowsMpvPlayerSurface(
         modifier = modifier.background(Color.Black),
         update = { surface ->
             surface.background = java.awt.Color.BLACK
-            if (surface.isDisplayable) {
-                runCatching { attachMpvRenderSurfaceOrThrow(handle, surface) }
-                    .onFailure { error -> reportFatalFailure("render-surface update", error) }
-            }
         },
     )
 }
@@ -704,137 +848,163 @@ private class WindowsMpvController(
     private val isReady: Boolean
         get() = player.getCurrentPlaybackState() != PlaybackState.FINISHED
 
-    override fun play() { player.resume() }
+    override fun play() {
+        runCatching { player.resume() }
+    }
 
-    override fun pause() { player.pause() }
+    override fun pause() {
+        runCatching { player.pause() }
+    }
 
-    override fun seekTo(positionMs: Long) { player.seekTo(positionMs) }
+    override fun seekTo(positionMs: Long) {
+        runCatching { player.seekTo(positionMs) }
+    }
 
-    override fun seekBy(offsetMs: Long) { player.skip(offsetMs) }
+    override fun seekBy(offsetMs: Long) {
+        runCatching { player.skip(offsetMs) }
+    }
 
     override fun retry() {
-        player.resume()
+        runCatching { player.resume() }
     }
 
     override fun setPlaybackSpeed(speed: Float) {
-        player.features[PlaybackSpeed]?.set(speed)
+        runCatching {
+            player.features[PlaybackSpeed]?.set(speed)
+        }
     }
 
-    override fun getAudioTracks(): List<AudioTrack> {
-        if (!isReady) return emptyList()
-        val count = handle.getPropertyInt("track-list/count")
-        val tracks = mutableListOf<AudioTrack>()
-        for (i in 0 until count) {
-            val type = handle.getPropertyString("track-list/$i/type")
-            if (type != "audio") continue
-            val id = handle.getPropertyInt("track-list/$i/id")
-            val title = handle.getPropertyString("track-list/$i/title")
-            val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
-            val selected = handle.getPropertyBoolean("track-list/$i/selected")
-            tracks.add(
-                AudioTrack(
-                    index = tracks.size,
-                    id = id.toString(),
-                    label = title.ifEmpty { lang ?: "Track $id" },
-                    language = lang,
-                    isSelected = selected,
-                ),
-            )
-        }
-        return tracks
-    }
+    override fun getAudioTracks(): List<AudioTrack> =
+        runCatching {
+            if (!isReady) return@runCatching emptyList()
 
-    override fun getSubtitleTracks(): List<SubtitleTrack> {
-        if (!isReady) return emptyList()
-        val count = handle.getPropertyInt("track-list/count")
-        val tracks = mutableListOf<SubtitleTrack>()
-        for (i in 0 until count) {
-            val type = handle.getPropertyString("track-list/$i/type")
-            if (type != "sub") continue
-            val id = handle.getPropertyInt("track-list/$i/id")
-            val title = handle.getPropertyString("track-list/$i/title")
-            val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
-            val selected = handle.getPropertyBoolean("track-list/$i/selected")
-            tracks.add(
-                SubtitleTrack(
-                    index = tracks.size,
-                    id = id.toString(),
-                    label = title.ifEmpty { lang ?: "Subtitle $id" },
-                    language = lang,
-                    isSelected = selected,
-                ),
-            )
-        }
-        return tracks
-    }
+            val count = handle.getPropertyIntSafe("track-list/count")
+            val tracks = mutableListOf<AudioTrack>()
+            for (i in 0 until count) {
+                val type = handle.getPropertyString("track-list/$i/type")
+                if (type != "audio") continue
+                val id = handle.getPropertyIntSafe("track-list/$i/id")
+                val title = handle.getPropertyString("track-list/$i/title")
+                val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
+                val selected = handle.getPropertyBoolean("track-list/$i/selected")
+                tracks.add(
+                    AudioTrack(
+                        index = tracks.size,
+                        id = id.toString(),
+                        label = title.ifEmpty { lang ?: "Track $id" },
+                        language = lang,
+                        isSelected = selected,
+                    ),
+                )
+            }
+            tracks
+        }.getOrElse { emptyList() }
+
+    override fun getSubtitleTracks(): List<SubtitleTrack> =
+        runCatching {
+            if (!isReady) return@runCatching emptyList()
+
+            val count = handle.getPropertyIntSafe("track-list/count")
+            val tracks = mutableListOf<SubtitleTrack>()
+            for (i in 0 until count) {
+                val type = handle.getPropertyString("track-list/$i/type")
+                if (type != "sub") continue
+                val id = handle.getPropertyIntSafe("track-list/$i/id")
+                val title = handle.getPropertyString("track-list/$i/title")
+                val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
+                val selected = handle.getPropertyBoolean("track-list/$i/selected")
+                tracks.add(
+                    SubtitleTrack(
+                        index = tracks.size,
+                        id = id.toString(),
+                        label = title.ifEmpty { lang ?: "Subtitle $id" },
+                        language = lang,
+                        isSelected = selected,
+                    ),
+                )
+            }
+            tracks
+        }.getOrElse { emptyList() }
 
     override fun selectAudioTrack(index: Int) {
-        val tracks = getAudioTracks()
-        if (index in tracks.indices) {
-            handle.setProperty("aid", tracks[index].id)
+        runCatching {
+            val tracks = getAudioTracks()
+            if (index in tracks.indices) {
+                handle.setProperty("aid", tracks[index].id)
+            }
         }
     }
 
     override fun selectSubtitleTrack(index: Int) {
-        if (index < 0) {
-            handle.setProperty("sid", "no")
-            return
-        }
-        val tracks = getSubtitleTracks()
-        if (index in tracks.indices) {
-            handle.setProperty("sid", tracks[index].id)
+        runCatching {
+            if (index < 0) {
+                handle.setProperty("sid", "no")
+                return@runCatching
+            }
+            val tracks = getSubtitleTracks()
+            if (index in tracks.indices) {
+                handle.setProperty("sid", tracks[index].id)
+            }
         }
     }
 
     override fun setSubtitleUri(url: String) {
-        handle.command("sub-add", url, "auto")
+        runCatching {
+            handle.command("sub-add", url, "auto")
+        }
     }
 
     override fun clearExternalSubtitle() {
-        if (!isReady) return
-        val count = handle.getPropertyInt("track-list/count")
-        for (i in count - 1 downTo 0) {
-            val type = handle.getPropertyString("track-list/$i/type")
-            val external = handle.getPropertyBoolean("track-list/$i/external")
-            if (type == "sub" && external) {
-                val id = handle.getPropertyInt("track-list/$i/id")
-                handle.command("sub-remove", id.toString())
-                return
+        runCatching {
+            if (!isReady) return@runCatching
+            val count = handle.getPropertyIntSafe("track-list/count")
+            for (i in count - 1 downTo 0) {
+                val type = handle.getPropertyString("track-list/$i/type")
+                val external = handle.getPropertyBoolean("track-list/$i/external")
+                if (type == "sub" && external) {
+                    val id = handle.getPropertyIntSafe("track-list/$i/id")
+                    handle.command("sub-remove", id.toString())
+                    return@runCatching
+                }
             }
         }
     }
 
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
-        clearExternalSubtitle()
-        selectSubtitleTrack(trackIndex)
+        runCatching {
+            clearExternalSubtitle()
+            selectSubtitleTrack(trackIndex)
+        }
     }
 
     override fun applySubtitleStyle(style: SubtitleStyleState) {
-        val colorHex = style.textColor.toMpvColorString()
-        val outline = if (style.outlineEnabled) 2.0 else 0.0
-        val subPos = 100 - style.bottomOffset
-        handle.option("sub-color", colorHex)
-        handle.setProperty("sub-border-size", outline)
-        handle.setProperty("sub-font-size", style.fontSizeSp.toDouble())
-        handle.setProperty("sub-pos", subPos)
+        runCatching {
+            val colorHex = style.textColor.toMpvColorString()
+            val outline = if (style.outlineEnabled) 2.0 else 0.0
+            val subPos = 100 - style.bottomOffset
+            handle.option("sub-color", colorHex)
+            handle.setProperty("sub-border-size", outline)
+            handle.setProperty("sub-font-size", style.fontSizeSp.toDouble())
+            handle.setProperty("sub-pos", subPos)
+        }
     }
 
     override fun switchSource(url: String, audioUrl: String?, headersJson: String?) {
-        // Parse headers from JSON if provided
-        if (headersJson != null) {
-            handle.option("http-header-fields-clr", "")
-            // Simple JSON parsing for header fields
-            val headerPattern = Regex(""""([^"]+)"\s*:\s*"([^"]+)"""")
-            headerPattern.findAll(headersJson).forEach { match ->
-                val (key, value) = match.destructured
-                handle.option("http-header-fields", "$key: $value")
+        runCatching {
+            if (headersJson != null) {
+                handle.option("http-header-fields-clr", "")
+                val headerPattern = Regex(""""([^"]+)"\s*:\s*"([^"]+)"""")
+                headerPattern.findAll(headersJson).forEach { match ->
+                    val (key, value) = match.destructured
+                    handle.option("http-header-fields", "$key: $value")
+                }
             }
-        }
-        handle.command("stop")
-        handle.command("playlist-clear")
-        handle.command("loadfile", url)
-        if (!audioUrl.isNullOrEmpty()) {
-            handle.command("audio-add", audioUrl, "auto")
+            handle.command("stop")
+            handle.command("playlist-clear")
+            handle.command("loadfile", url)
+            if (!audioUrl.isNullOrEmpty()) {
+                handle.command("audio-add", audioUrl, "auto")
+            }
         }
     }
 }
@@ -851,25 +1021,100 @@ private fun MPVHandle.setProperty(name: String, value: Int): Boolean =
 private fun MPVHandle.setProperty(name: String, value: String): Boolean =
     setPropertyString(name, value)
 
+/**
+ * Safe replacement for [MPVHandle.getPropertyInt].
+ *
+ * The native `nGetPropertyInt` binding in mediamp-mpv has a stack buffer
+ * overflow: it declares a 4-byte `int` on the native stack and then asks mpv
+ * to fill it using `MPV_FORMAT_INT64`, which writes 8 bytes. The overflow
+ * corrupts adjacent stack memory and reliably crashes the JVM with
+ * `EXCEPTION_ACCESS_VIOLATION` inside `nGetPropertyInt` (see hs_err_pid log).
+ *
+ * [MPVHandle.getPropertyString] is unaffected because its underlying C++
+ * buffer is `char *` (8 bytes on x64). We therefore fetch the value as a
+ * string and parse it ourselves. If mpv is not ready (track list not yet
+ * populated, property absent, etc.), we return `0` / `null` instead of
+ * propagating an error.
+ */
+private fun MPVHandle.getPropertyIntSafe(name: String): Int {
+    val raw = runCatching { getPropertyString(name) }.getOrNull() ?: return 0
+    if (raw.isEmpty()) return 0
+    return raw.trim().toIntOrNull() ?: 0
+}
+
 private fun attachMpvRenderSurface(
     handle: MPVHandle,
     surface: Canvas,
 ): Boolean {
+    if (!surface.isDisplayable) return false
+    if (!surface.isShowing) return false
+    if (surface.width <= 0 || surface.height <= 0) return false
+
     val nativePtr = Native.getComponentPointer(surface) ?: return false
-    return handle.option("wid", Pointer.nativeValue(nativePtr).toString())
+    val wid = Pointer.nativeValue(nativePtr)
+    if (wid == 0L) return false
+
+    DesktopRuntimeDiagnostics.info(
+        tag = "PlayerDesktop",
+        message = "Attempting MPV surface attach: displayable=${surface.isDisplayable}, showing=${surface.isShowing}, size=${surface.width}x${surface.height}, wid=$wid",
+    )
+
+    // NOTE: The native `set_option` wrapper in mediamp-mpv has an inverted return
+    // value (it returns the raw `mpv_set_option_string` int cast to bool, so 0 =
+    // success becomes `false`). We therefore cannot use `handle.option(...)` when
+    // we need to observe success. `setPropertyString` wraps `mpv_set_property`
+    // with a correct `>= 0` check and, since mpv 0.21 / client API 1.23, most
+    // options — including "wid" — can be set via the property API even after
+    // `mpv_initialize()` (which `MpvMediampPlayer` calls from its constructor).
+    val ok = handle.setPropertyString("wid", wid.toString())
+    if (!ok) {
+        // Fallback: try the legacy option API. Even if its Kotlin return is
+        // inverted, calling it is harmless — subsequent surface attach logic
+        // will confirm embedding via rendering.
+        runCatching { handle.option("wid", wid.toString()) }
+    }
+
+    // Force the VO to rebuild so it picks up the freshly-set `wid`. mpv's
+    // documentation warns that changing `wid` at runtime "may or may not work";
+    // toggling `vo` is the reliable trick to trigger a clean reconfigure of
+    // the video output against the new window. Errors here are non-fatal.
+    runCatching {
+        handle.setPropertyString("vo", "null")
+        handle.setPropertyString("vo", "gpu-next")
+    }
+    return true
 }
 
-private fun attachMpvRenderSurfaceOrThrow(
+private suspend fun attachMpvRenderSurfaceOrThrow(
     handle: MPVHandle,
     surface: Canvas,
 ) {
-    check(attachMpvRenderSurface(handle, surface)) {
-        "Failed to attach MPV render surface to a native window."
+    repeat(30) { attempt ->
+        val attached = withContext(Dispatchers.Main) {
+            attachMpvRenderSurface(handle, surface)
+        }
+        if (attached) {
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "MPV render surface attached successfully on attempt ${attempt + 1}.",
+            )
+            return
+        }
+        delay(50)
     }
+
+    error("Failed to attach MPV render surface to a native window.")
 }
 
-private fun detachMpvRenderSurface(handle: MPVHandle): Boolean =
-    handle.option("wid", "0")
+private fun detachMpvRenderSurface(handle: MPVHandle): Boolean {
+    // Same inverted-return caveat as in `attachMpvRenderSurface` — prefer the
+    // property API and fall back silently if unsupported.
+    val ok = runCatching { handle.setPropertyString("wid", "0") }.getOrDefault(false)
+    if (!ok) {
+        runCatching { handle.option("wid", "0") }
+    }
+    return true
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // macOS: existing JNA bridge (unchanged)

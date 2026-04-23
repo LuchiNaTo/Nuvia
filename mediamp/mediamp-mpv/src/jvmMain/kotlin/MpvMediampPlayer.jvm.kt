@@ -107,14 +107,11 @@ actual class MpvMediampPlayer (
             is Platform.Windows -> {
                 handle.option("gpu-context", "d3d11")
                 handle.option("opengl-es", "no")
-
-                handle.option("ao", "audiotrack")
+                handle.option("ao", "wasapi")
             }
             is Platform.MacOS -> {
                 handle.option("gpu-context", "macvk")
                 handle.option("opengl-es", "no")
-
-                handle.option("ao", "audiotrack")
             }
 
             else -> { }
@@ -189,26 +186,29 @@ actual class MpvMediampPlayer (
         when (playbackState.value) {
             PlaybackState.READY -> {
                 val media = openResource.value ?: return
-                handle.option("pause", "true")
                 when (val data = media.mediaData) {
                     is UriMediaData -> {
                         handle.command("loadfile", data.uri)
-                        playbackState.value = PlaybackState.PLAYING
+                        handle.setPropertyBoolean("pause", false)
                     }
                     is SeekableInputMediaData -> TODO()
-                    else -> { } // TODO: log unsupported media type
+                    else -> { }
                 }
             }
-            PlaybackState.PLAYING -> {
-                handle.command("cycle", "pause")
+
+            PlaybackState.PAUSED,
+            PlaybackState.PAUSED_BUFFERING -> {
+                handle.setPropertyBoolean("pause", false)
             }
-            else -> { } // TODO: unreachable
+
+            PlaybackState.PLAYING -> Unit
+            else -> Unit
         }
     }
 
     override fun pauseImpl() {
         if (playbackState.value == PlaybackState.PAUSED) return
-        handle.command("cycle", "pause")
+        handle.setPropertyBoolean("pause", true)
     }
 
     override fun seekTo(positionMillis: Long) {
