@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player
 
+import co.touchlab.kermit.Logger
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -72,6 +73,7 @@ private const val PlayerDoubleTapSeekResetDelayMs = 800L
 private const val PlayerLeftGestureBoundary = 0.4f
 private const val PlayerRightGestureBoundary = 0.6f
 private const val PlayerVerticalGestureSensitivity = 1f
+private val playerLog = Logger.withTag("PlayerScreen")
 private val PlayerSliderOverlayGap = 12.dp
 private val PlayerTimeRowHeight = 36.dp
 private val PlayerActionRowHeight = 50.dp
@@ -220,6 +222,12 @@ fun PlayerScreen(
         val displayedPositionMs = scrubbingPositionMs ?: playbackSnapshot.positionMs
         val isEpisode = activeSeasonNumber != null && activeEpisodeNumber != null
         val currentGestureFeedback = liveGestureFeedback ?: gestureFeedback
+
+        LaunchedEffect(errorMessage) {
+            if (errorMessage != null) {
+                playerLog.e { "Player error UI shown: $errorMessage" }
+            }
+        }
 
         LaunchedEffect(currentGestureFeedback) {
             if (currentGestureFeedback != null) {

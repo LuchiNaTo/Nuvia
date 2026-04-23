@@ -4,6 +4,7 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
+import com.nuvio.app.desktop.DesktopRuntimeDiagnostics
 import com.nuvio.app.desktop.DesktopPaths
 import java.awt.Color as AwtColor
 
@@ -16,7 +17,13 @@ private fun configureMacOsNativeAppearance() {
 }
 
 private fun configureDesktopRuntimeEnvironment() {
+    DesktopRuntimeDiagnostics.initialize()
     System.setProperty("mediamp.cache.dir", DesktopPaths.cacheRoot.toString())
+    DesktopRuntimeDiagnostics.info(
+        tag = "DesktopApp",
+        message = "Desktop cache root=${DesktopPaths.cacheRoot}, logFile=${DesktopRuntimeDiagnostics.logFile}",
+    )
+    DesktopRuntimeDiagnostics.logStartupConfiguration()
 }
 
 fun main() {

@@ -8,6 +8,7 @@
 
 package org.openani.mediamp.mpv
 
+// import com.sun.jna.platform.win32.Kernel32
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
@@ -26,6 +27,7 @@ internal actual object LibraryLoader {
 
     actual fun loadLibraries(context: Any?) {
         val runtimeDir = ensureExtracted()
+        // registerWindowsDllDirectory(runtimeDir)
         ensureRuntimeLoaded(runtimeDir)
     }
 
@@ -50,6 +52,24 @@ internal actual object LibraryLoader {
             loadedRuntimeDirs += key
         }
     }
+
+    // private fun registerWindowsDllDirectory(dir: File) {
+    //     if (!osName.contains("win")) return
+    //     if (!dir.exists() || !dir.isDirectory) return
+
+    //     runCatching {
+    //         val ok = Kernel32.INSTANCE.SetDllDirectory(dir.absolutePath)
+    //         if (!ok) {
+    //             val error = Kernel32.INSTANCE.GetLastError()
+    //             println("mediamp-mpv: SetDllDirectory failed for '${dir.absolutePath}', error=$error")
+    //         } else {
+    //             println("mediamp-mpv: registered DLL directory '${dir.absolutePath}'")
+    //         }
+    //     }.onFailure { t ->
+    //         println("mediamp-mpv: failed to register DLL directory '${dir.absolutePath}': ${t.message}")
+    //         t.printStackTrace()
+    //     }
+    // }
 
     private fun extractNativeBinaries(): File {
         val dir = resolveExtractionDirectory()

@@ -1,5 +1,6 @@
 package com.nuvio.app.features.player
 
+import com.nuvio.app.desktop.DesktopRuntimeDiagnostics
 import com.sun.jna.Library
 import com.sun.jna.Native
 import com.sun.jna.Pointer
@@ -176,6 +177,10 @@ internal interface WindowsDesktopMPVBridgeLib : Library {
     companion object {
         private val loadedInstance: WindowsDesktopMPVBridgeLib? by lazy {
             if (!nativeBridgeEnabled) {
+                DesktopRuntimeDiagnostics.info(
+                    tag = "NativePlayerBridge",
+                    message = "Experimental Windows native bridge disabled; mediamp/mpv remains the primary backend.",
+                )
                 return@lazy null
             }
 
@@ -188,12 +193,27 @@ internal interface WindowsDesktopMPVBridgeLib : Library {
                 )
             }
 
+            DesktopRuntimeDiagnostics.info(
+                tag = "NativePlayerBridge",
+                message = if (libraryFile != null) {
+                    "Attempting to load Windows native bridge from ${libraryFile.absolutePath}"
+                } else {
+                    "Attempting to load Windows native bridge from PATH/JNA library path"
+                },
+            )
+
             runCatching {
                 if (libraryFile != null) {
                     Native.load(libraryFile.absolutePath, WindowsDesktopMPVBridgeLib::class.java)
                 } else {
                     Native.load("NuvioWindowsBridge", WindowsDesktopMPVBridgeLib::class.java)
                 }
+            }.onFailure { error ->
+                DesktopRuntimeDiagnostics.warn(
+                    tag = "NativePlayerBridge",
+                    message = "Windows native bridge is unavailable; falling back to mediamp/mpv.",
+                    throwable = error,
+                )
             }.getOrNull()
         }
 

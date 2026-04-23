@@ -45,4 +45,8 @@ internal object DesktopPaths {
     val cacheRoot: Path by lazy {
         ensureDirectory(localDataRoot.resolve("cache"))
     }
+
+    val logsRoot: Path by lazy {
+        ensureDirectory(cacheRoot.resolve("logs"))
+    }
 }

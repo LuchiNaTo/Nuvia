@@ -21,6 +21,11 @@ import java.util.Properties
 import javax.inject.Inject
 
 abstract class GenerateRuntimeConfigsTask : DefaultTask() {
+    private data class ResolvedRuntimeValue(
+        val value: String,
+        val source: String,
+    )
+
     @get:OutputDirectory
     abstract val outputDir: DirectoryProperty
 
@@ -28,16 +33,85 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
     @get:InputFile
     abstract val localPropertiesFile: RegularFileProperty
 
+    @get:Optional
+    @get:InputFile
+    abstract val releasePropertiesFile: RegularFileProperty
+
     @get:Input
     abstract val appVersionName: Property<String>
 
     @get:Input
     abstract val appVersionCode: Property<Int>
 
+    private fun loadProperties(file: File?): Properties =
+        Properties().apply {
+            file
+                ?.takeIf(File::exists)
+                ?.inputStream()
+                ?.use(::load)
+        }
+
+    private fun resolveRuntimeValue(
+        key: String,
+        releaseProperties: Properties,
+        localProperties: Properties,
+        defaultValue: String = "",
+    ): ResolvedRuntimeValue {
+        System.getenv(key)
+            ?.takeIf(String::isNotBlank)
+            ?.let { return ResolvedRuntimeValue(it, "env:$key") }
+
+        localProperties.getProperty(key)
+            ?.takeIf(String::isNotBlank)
+            ?.let { return ResolvedRuntimeValue(it, "local.properties") }
+
+        releaseProperties.getProperty(key)
+            ?.takeIf(String::isNotBlank)
+            ?.let { return ResolvedRuntimeValue(it, "release.properties") }
+
+        return ResolvedRuntimeValue(defaultValue, "default")
+    }
+
+    private fun runtimeMode(supabaseSource: String, supabaseUrl: String): String =
+        when {
+            supabaseUrl.isBlank() -> "unconfigured"
+            supabaseSource.startsWith("env:") || supabaseSource == "local.properties" -> "development"
+            supabaseSource == "release.properties" -> "release"
+            else -> "default"
+        }
+
+    private fun kotlinStringLiteral(value: String): String =
+        buildString(value.length + 8) {
+            value.forEach { character ->
+                when (character) {
+                    '\\' -> append("\\\\")
+                    '"' -> append("\\\"")
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    else -> append(character)
+                }
+            }
+        }
+
     @TaskAction
     fun generate() {
-        val props = Properties()
-        localPropertiesFile.asFile.orNull?.takeIf { it.exists() }?.inputStream()?.use { props.load(it) }
+        val releaseProperties = loadProperties(releasePropertiesFile.asFile.orNull)
+        val localProperties = loadProperties(localPropertiesFile.asFile.orNull)
+        val supabaseUrl = resolveRuntimeValue("SUPABASE_URL", releaseProperties, localProperties)
+        val supabaseAnonKey = resolveRuntimeValue("SUPABASE_ANON_KEY", releaseProperties, localProperties)
+        val traktClientId = resolveRuntimeValue("TRAKT_CLIENT_ID", releaseProperties, localProperties)
+        val traktClientSecret = resolveRuntimeValue("TRAKT_CLIENT_SECRET", releaseProperties, localProperties)
+        val traktRedirectUri = resolveRuntimeValue(
+            key = "TRAKT_REDIRECT_URI",
+            releaseProperties = releaseProperties,
+            localProperties = localProperties,
+            defaultValue = "nuvio://auth/trakt",
+        )
+        val introDbUrl = resolveRuntimeValue("INTRODB_API_URL", releaseProperties, localProperties)
+        val donationsBaseUrl = resolveRuntimeValue("DONATIONS_BASE_URL", releaseProperties, localProperties)
+        val donationsDonateUrl = resolveRuntimeValue("DONATIONS_DONATE_URL", releaseProperties, localProperties)
+        val resolvedRuntimeMode = runtimeMode(supabaseUrl.source, supabaseUrl.value)
 
         val outDir = outputDir.get().asFile
         outDir.resolve("com/nuvio/app/core/network").apply {
@@ -47,8 +121,8 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |package com.nuvio.app.core.network
                 |
                 |object SupabaseConfig {
-                |    const val URL = "${props.getProperty("SUPABASE_URL", "")}" 
-                |    const val ANON_KEY = "${props.getProperty("SUPABASE_ANON_KEY", "")}" 
+                |    const val URL = "${kotlinStringLiteral(supabaseUrl.value)}"
+                |    const val ANON_KEY = "${kotlinStringLiteral(supabaseAnonKey.value)}"
                 |}
                 """.trimMargin()
             )
@@ -63,9 +137,9 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |package com.nuvio.app.features.trakt
                 |
                 |object TraktConfig {
-                |    const val CLIENT_ID = "${props.getProperty("TRAKT_CLIENT_ID", "")}" 
-                |    const val CLIENT_SECRET = "${props.getProperty("TRAKT_CLIENT_SECRET", "")}" 
-                |    const val REDIRECT_URI = "${props.getProperty("TRAKT_REDIRECT_URI", "nuvio://auth/trakt")}" 
+                |    const val CLIENT_ID = "${kotlinStringLiteral(traktClientId.value)}"
+                |    const val CLIENT_SECRET = "${kotlinStringLiteral(traktClientSecret.value)}"
+                |    const val REDIRECT_URI = "${kotlinStringLiteral(traktRedirectUri.value)}"
                 |}
                 """.trimMargin()
             )
@@ -78,7 +152,7 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |package com.nuvio.app.features.player.skip
                 |
                 |object IntroDbConfig {
-                |    const val URL = "${props.getProperty("INTRODB_API_URL", "")}" 
+                |    const val URL = "${kotlinStringLiteral(introDbUrl.value)}"
                 |}
                 """.trimMargin()
             )
@@ -96,6 +170,19 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |}
                 """.trimMargin()
             )
+            resolve("RuntimeConfigInfo.kt").writeText(
+                """
+                |package com.nuvio.app.core.build
+                |
+                |object RuntimeConfigInfo {
+                |    const val MODE = "${kotlinStringLiteral(resolvedRuntimeMode)}"
+                |    const val SUPABASE_SOURCE = "${kotlinStringLiteral(supabaseUrl.source)}"
+                |    const val COMMUNITY_SOURCE = "${kotlinStringLiteral(donationsBaseUrl.source)}"
+                |    const val INTRODB_SOURCE = "${kotlinStringLiteral(introDbUrl.source)}"
+                |    const val TRAKT_SOURCE = "${kotlinStringLiteral(traktClientId.source)}"
+                |}
+                """.trimMargin()
+            )
         }
 
         outDir.resolve("com/nuvio/app/features/settings").apply {
@@ -105,8 +192,8 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
                 |package com.nuvio.app.features.settings
                 |
                 |object CommunityConfig {
-                |    const val DONATIONS_BASE_URL = "${props.getProperty("DONATIONS_BASE_URL", "")}" 
-                |    const val DONATIONS_DONATE_URL = "${props.getProperty("DONATIONS_DONATE_URL", "")}" 
+                |    const val DONATIONS_BASE_URL = "${kotlinStringLiteral(donationsBaseUrl.value)}"
+                |    const val DONATIONS_DONATE_URL = "${kotlinStringLiteral(donationsDonateUrl.value)}"
                 |}
                 """.trimMargin()
             )
@@ -296,6 +383,10 @@ val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generat
     val localProperties = rootProject.file("local.properties")
     if (localProperties.exists()) {
         localPropertiesFile.set(rootProject.layout.projectDirectory.file("local.properties"))
+    }
+    val releaseProperties = layout.projectDirectory.file("runtime-config/release.properties").asFile
+    if (releaseProperties.exists()) {
+        releasePropertiesFile.set(layout.projectDirectory.file("runtime-config/release.properties"))
     }
     appVersionName.set(releaseAppVersionName)
     appVersionCode.set(releaseAppVersionCode)

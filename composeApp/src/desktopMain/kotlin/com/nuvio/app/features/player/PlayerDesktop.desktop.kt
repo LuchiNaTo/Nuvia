@@ -30,6 +30,7 @@ import com.nuvio.app.core.sync.encodeSyncFloat
 import com.nuvio.app.core.sync.encodeSyncInt
 import com.nuvio.app.core.sync.encodeSyncString
 import com.nuvio.app.core.sync.encodeSyncStringSet
+import com.nuvio.app.desktop.DesktopRuntimeDiagnostics
 import com.nuvio.app.desktop.DesktopPreferences
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.streams.AddonStreamGroup
@@ -77,6 +78,18 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
+    LaunchedEffect(isMacOS, hasWindowsNativeBridge) {
+        val selectedBackend = when {
+            isMacOS -> "macos-native-bridge"
+            hasWindowsNativeBridge -> "windows-native-bridge"
+            else -> "windows-mediamp-mpv"
+        }
+        DesktopRuntimeDiagnostics.info(
+            tag = "PlayerDesktop",
+            message = "Selected player backend=$selectedBackend",
+        )
+    }
+
     if (isMacOS) {
         MacOSPlayerSurface(
             sourceUrl = sourceUrl,
@@ -448,6 +461,29 @@ private fun WindowsNativePlayerSurface(
 // Windows: mediamp-mpv backed inline Compose rendering
 // ──────────────────────────────────────────────────────────────────────────────
 
+private data class WindowsMpvSession(
+    val player: MpvMediampPlayer,
+    val handle: MPVHandle,
+    val renderSurface: Canvas,
+)
+
+private object NoOpPlayerEngineController : PlayerEngineController {
+    override fun play() = Unit
+    override fun pause() = Unit
+    override fun seekTo(positionMs: Long) = Unit
+    override fun seekBy(offsetMs: Long) = Unit
+    override fun retry() = Unit
+    override fun setPlaybackSpeed(speed: Float) = Unit
+    override fun getAudioTracks(): List<AudioTrack> = emptyList()
+    override fun getSubtitleTracks(): List<SubtitleTrack> = emptyList()
+    override fun selectAudioTrack(index: Int) = Unit
+    override fun selectSubtitleTrack(index: Int) = Unit
+    override fun setSubtitleUri(url: String) = Unit
+    override fun clearExternalSubtitle() = Unit
+    override fun clearExternalSubtitleAndSelect(trackIndex: Int) = Unit
+    override fun switchSource(url: String, audioUrl: String?, headersJson: String?) = Unit
+}
+
 @OptIn(InternalMediampApi::class)
 @Composable
 private fun WindowsMpvPlayerSurface(
@@ -461,34 +497,88 @@ private fun WindowsMpvPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    val player = remember {
-        MpvMediampPlayer(Unit, kotlin.coroutines.EmptyCoroutineContext)
-    }
-    val handle = remember(player) { player.impl as MPVHandle }
-    val renderSurface = remember {
-        Canvas().apply {
-            background = java.awt.Color.BLACK
+    val currentOnControllerReady by rememberUpdatedState(onControllerReady)
+    val currentOnSnapshot by rememberUpdatedState(onSnapshot)
+    val currentOnError by rememberUpdatedState(onError)
+    var fatalErrorMessage by remember { mutableStateOf<String?>(null) }
+    val sessionResult = remember {
+        runCatching {
+            val player = MpvMediampPlayer(Unit, kotlin.coroutines.EmptyCoroutineContext)
+            val handle = player.impl as? MPVHandle
+                ?: error("mediamp player did not expose an MPVHandle")
+            WindowsMpvSession(
+                player = player,
+                handle = handle,
+                renderSurface = Canvas().apply {
+                    background = java.awt.Color.BLACK
+                },
+            )
         }
     }
+
+    fun reportFatalFailure(
+        phase: String,
+        throwable: Throwable,
+    ) {
+        val message = throwable.message?.takeIf { it.isNotBlank() }
+            ?: "Windows mediamp/mpv failed during $phase"
+
+        if (fatalErrorMessage == message) return
+
+        DesktopRuntimeDiagnostics.error(
+            tag = "PlayerDesktop",
+            message = "Windows mediamp/mpv failure during $phase; switching to controlled error UI.",
+            throwable = throwable,
+        )
+        fatalErrorMessage = message
+        currentOnError(message)
+    }
+
+    LaunchedEffect(sessionResult.exceptionOrNull()) {
+        sessionResult.exceptionOrNull()?.let { error ->
+            reportFatalFailure("initialization", error)
+        }
+    }
+
+    LaunchedEffect(fatalErrorMessage) {
+        if (fatalErrorMessage != null) {
+            DesktopRuntimeDiagnostics.warn(
+                tag = "PlayerDesktop",
+                message = "Player fallback/error UI path triggered.",
+            )
+            currentOnControllerReady(NoOpPlayerEngineController)
+            currentOnSnapshot(PlayerPlaybackSnapshot())
+        }
+    }
+
+    val session = sessionResult.getOrNull()
+    if (session == null || fatalErrorMessage != null) {
+        Box(
+            modifier = modifier
+                .fillMaxSize()
+                .background(Color.Black),
+        )
+        return
+    }
+
+    val player = session.player
+    val handle = session.handle
+    val renderSurface = session.renderSurface
 
     DisposableEffect(player, renderSurface) {
         val hierarchyListener = HierarchyListener { event ->
             val displayabilityChanged =
                 event.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong() != 0L
             if (displayabilityChanged && renderSurface.isDisplayable) {
-                runCatching { attachMpvRenderSurface(handle, renderSurface) }
-                    .onFailure { error ->
-                        onError(error.message ?: "Failed to attach MPV render surface")
-                    }
+                runCatching { attachMpvRenderSurfaceOrThrow(handle, renderSurface) }
+                    .onFailure { error -> reportFatalFailure("render-surface attach", error) }
             }
         }
 
         renderSurface.addHierarchyListener(hierarchyListener)
         if (renderSurface.isDisplayable) {
-            runCatching { attachMpvRenderSurface(handle, renderSurface) }
-                .onFailure { error ->
-                    onError(error.message ?: "Failed to attach MPV render surface")
-                }
+            runCatching { attachMpvRenderSurfaceOrThrow(handle, renderSurface) }
+                .onFailure { error -> reportFatalFailure("render-surface attach", error) }
         }
 
         onDispose {
@@ -501,6 +591,10 @@ private fun WindowsMpvPlayerSurface(
     // Load source
     LaunchedEffect(sourceUrl, sourceAudioUrl) {
         try {
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "Initializing mediamp/mpv playback path.",
+            )
             val headers = sourceHeaders.toMutableMap()
             player.setMediaData(UriMediaData(sourceUrl, headers))
 
@@ -513,7 +607,7 @@ private fun WindowsMpvPlayerSurface(
                 player.resume()
             }
         } catch (e: Exception) {
-            onError(e.message ?: "Failed to load media")
+            reportFatalFailure("media load", e)
         }
     }
 
@@ -546,7 +640,7 @@ private fun WindowsMpvPlayerSurface(
     }
 
     LaunchedEffect(controller) {
-        onControllerReady(controller)
+        currentOnControllerReady(controller)
     }
 
     // Collect playback state and report snapshots
@@ -566,7 +660,7 @@ private fun WindowsMpvPlayerSurface(
                 playbackSpeed = player.features[PlaybackSpeed]?.value ?: 1.0f,
             )
         }.collectLatest { snapshot ->
-            onSnapshot(snapshot)
+            currentOnSnapshot(snapshot)
         }
     }
 
@@ -574,9 +668,13 @@ private fun WindowsMpvPlayerSurface(
     LaunchedEffect(player) {
         player.playbackState.collectLatest { state ->
             if (state == PlaybackState.ERROR) {
-                onError("Playback error")
-            } else {
-                onError(null)
+                DesktopRuntimeDiagnostics.warn(
+                    tag = "PlayerDesktop",
+                    message = "mediamp reported PlaybackState.ERROR.",
+                )
+                currentOnError("Playback error")
+            } else if (fatalErrorMessage == null) {
+                currentOnError(null)
             }
         }
     }
@@ -587,10 +685,8 @@ private fun WindowsMpvPlayerSurface(
         update = { surface ->
             surface.background = java.awt.Color.BLACK
             if (surface.isDisplayable) {
-                runCatching { attachMpvRenderSurface(handle, surface) }
-                    .onFailure { error ->
-                        onError(error.message ?: "Failed to attach MPV render surface")
-                    }
+                runCatching { attachMpvRenderSurfaceOrThrow(handle, surface) }
+                    .onFailure { error -> reportFatalFailure("render-surface update", error) }
             }
         },
     )
@@ -761,6 +857,15 @@ private fun attachMpvRenderSurface(
 ): Boolean {
     val nativePtr = Native.getComponentPointer(surface) ?: return false
     return handle.option("wid", Pointer.nativeValue(nativePtr).toString())
+}
+
+private fun attachMpvRenderSurfaceOrThrow(
+    handle: MPVHandle,
+    surface: Canvas,
+) {
+    check(attachMpvRenderSurface(handle, surface)) {
+        "Failed to attach MPV render surface to a native window."
+    }
 }
 
 private fun detachMpvRenderSurface(handle: MPVHandle): Boolean =

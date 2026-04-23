@@ -23,3 +23,7 @@ keystore/
 scripts/build-distribution.sh
 asset
 scripts/scrape_android_compose_animation_docs.py
+hs_err_pid6368.log
+hs_err_pid25104.log
+replay_pid6368.log
+replay_pid25104.log

@@ -53,6 +53,9 @@ kotlin {
                 implementation(projects.mediampInternalUtils)
             }
         }
+        jvmMain.dependencies {
+            implementation(libs.jna.platform)
+        }
         desktopMain.dependencies {
             api(libs.jna.platform)
         }
