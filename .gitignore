@@ -27,3 +27,6 @@ hs_err_pid6368.log
 hs_err_pid25104.log
 replay_pid6368.log
 replay_pid25104.log
+.junie/AGENTS.md
+.vscode/mcp.json
+.aider*
