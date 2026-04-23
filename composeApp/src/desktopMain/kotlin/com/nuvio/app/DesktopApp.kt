@@ -16,12 +16,30 @@ private fun configureMacOsNativeAppearance() {
     System.setProperty("apple.awt.application.appearance", "NSAppearanceNameDarkAqua")
 }
 
+private fun configureWindowsComposeInterop() {
+    val osName = System.getProperty("os.name")?.lowercase() ?: return
+    if (!osName.contains("windows")) return
+    if (System.getProperty("compose.interop.blending").isNullOrBlank()) {
+        System.setProperty("compose.interop.blending", "true")
+    // val explicitInteropOverride = System.getProperty("nuvio.compose.interop.blending")
+    //     ?: System.getenv("NUVIO_COMPOSE_INTEROP_BLENDING")
+    // if (!explicitInteropOverride.isNullOrBlank()) {
+    //     System.setProperty("compose.interop.blending", explicitInteropOverride)
+    }
+}
+
 private fun configureDesktopRuntimeEnvironment() {
+    configureWindowsComposeInterop()
     DesktopRuntimeDiagnostics.initialize()
     System.setProperty("mediamp.cache.dir", DesktopPaths.cacheRoot.toString())
     DesktopRuntimeDiagnostics.info(
         tag = "DesktopApp",
         message = "Desktop cache root=${DesktopPaths.cacheRoot}, logFile=${DesktopRuntimeDiagnostics.logFile}",
+    )
+    DesktopRuntimeDiagnostics.info(
+        tag = "DesktopApp",
+        message = "compose.interop.blending=${System.getProperty("compose.interop.blending") ?: "<unset>"}, " +
+            "requestedSkikoRenderApi=${System.getProperty("skiko.renderApi") ?: "<default>"}",
     )
     DesktopRuntimeDiagnostics.logStartupConfiguration()
 }

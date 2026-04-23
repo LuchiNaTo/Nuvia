@@ -468,6 +468,56 @@ private data class WindowsMpvSession(
     val renderSurface: Canvas,
 )
 
+private object DesktopPlayerGestureBridge {
+    private val lock = Any()
+    private var token: Any? = null
+    private var currentVolumeProvider: (() -> PlayerAudioLevel?)? = null
+    private var setVolumeProvider: ((Float) -> PlayerAudioLevel?)? = null
+
+    fun register(
+        token: Any,
+        currentVolumeProvider: () -> PlayerAudioLevel?,
+        setVolumeProvider: (Float) -> PlayerAudioLevel?,
+    ) {
+        synchronized(lock) {
+            this.token = token
+            this.currentVolumeProvider = currentVolumeProvider
+            this.setVolumeProvider = setVolumeProvider
+        }
+    }
+
+    fun unregister(token: Any) {
+        synchronized(lock) {
+            if (this.token != token) return
+            this.token = null
+            currentVolumeProvider = null
+            setVolumeProvider = null
+        }
+    }
+
+    fun currentVolume(): PlayerAudioLevel? {
+        val provider = synchronized(lock) { currentVolumeProvider }
+        return provider?.invoke()
+    }
+
+    fun setVolume(level: Float): PlayerAudioLevel? {
+        val provider = synchronized(lock) { setVolumeProvider }
+        return provider?.invoke(level.coerceIn(0f, 1f))
+    }
+}
+
+private object DesktopPlayerGestureController : PlayerGestureController {
+    override fun currentBrightness(): Float? = null
+
+    override fun setBrightness(level: Float): Float? = null
+
+    override fun currentVolume(): PlayerAudioLevel? =
+        DesktopPlayerGestureBridge.currentVolume()
+
+    override fun setVolume(level: Float): PlayerAudioLevel? =
+        DesktopPlayerGestureBridge.setVolume(level)
+}
+
 private object NoOpPlayerEngineController : PlayerEngineController {
     override fun play() = Unit
     override fun pause() = Unit
@@ -592,7 +642,13 @@ private fun WindowsMpvPlayerSurface(
     val renderSurface = session.renderSurface
 
     DisposableEffect(player, renderSurface) {
+        DesktopPlayerGestureBridge.register(
+            token = player,
+            currentVolumeProvider = { handle.readVolumeLevel() },
+            setVolumeProvider = { level -> handle.writeVolumeLevel(level) },
+        )
         onDispose {
+            DesktopPlayerGestureBridge.unregister(player)
             sessionClosed = true
             surfaceAttached = false
             runCatching { detachMpvRenderSurface(handle) }
@@ -979,6 +1035,31 @@ private fun MPVHandle.setProperty(name: String, value: Int): Boolean =
 
 private fun MPVHandle.setProperty(name: String, value: String): Boolean =
     setPropertyString(name, value)
+
+private fun MPVHandle.readVolumeLevel(): PlayerAudioLevel? {
+    val volume = runCatching {
+        getPropertyString("volume")
+            .trim()
+            .toFloatOrNull()
+    }.getOrNull() ?: return null
+
+    val clampedFraction = (volume / 100f).coerceIn(0f, 1f)
+    val muted = runCatching { getPropertyBoolean("mute") }.getOrDefault(clampedFraction <= 0f)
+    return PlayerAudioLevel(
+        fraction = clampedFraction,
+        isMuted = muted,
+    )
+}
+
+private fun MPVHandle.writeVolumeLevel(level: Float): PlayerAudioLevel? {
+    val clampedLevel = level.coerceIn(0f, 1f)
+    runCatching { setPropertyDouble("volume", clampedLevel * 100.0) }
+    runCatching { setPropertyBoolean("mute", clampedLevel <= 0f) }
+    return readVolumeLevel() ?: PlayerAudioLevel(
+        fraction = clampedLevel,
+        isMuted = clampedLevel <= 0f,
+    )
+}
 
 private data class WindowsMpvStartupState(
     val playbackState: PlaybackState,
@@ -1951,7 +2032,9 @@ actual fun ManagePlayerPictureInPicture(
 ) = Unit
 
 @Composable
-actual fun rememberPlayerGestureController(): PlayerGestureController? = null
+actual fun rememberPlayerGestureController(): PlayerGestureController? = remember {
+    DesktopPlayerGestureController
+}
 
 actual val usesNativePlayerChrome: Boolean
     get() = isMacOS

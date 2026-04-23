@@ -70,6 +70,7 @@ import kotlin.math.roundToInt
 private const val PlaybackProgressPersistIntervalMs = 60_000L
 private const val PlayerDoubleTapSeekStepMs = 10_000L
 private const val PlayerDoubleTapSeekResetDelayMs = 800L
+private const val PlayerEndedConfirmationThresholdMs = 2_000L
 private const val PlayerLeftGestureBoundary = 0.4f
 private const val PlayerRightGestureBoundary = 0.6f
 private const val PlayerVerticalGestureSensitivity = 1f
@@ -106,6 +107,12 @@ private data class PlayerAccumulatedSeekState(
     val baselinePositionMs: Long,
     val amountMs: Long,
 )
+
+// private fun PlayerPlaybackSnapshot.isConfirmedEnded(): Boolean {
+//     if (!isEnded) return false
+//     if (durationMs <= 0L) return true
+//     return positionMs >= (durationMs - PlayerEndedConfirmationThresholdMs).coerceAtLeast(0L)
+// }
 
 @Composable
 fun PlayerScreen(
