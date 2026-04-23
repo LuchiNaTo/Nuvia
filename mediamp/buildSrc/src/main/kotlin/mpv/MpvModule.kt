@@ -1,5 +1,6 @@
 package mpv
 
+import localcomposite.isLocalCompositeMediamp
 import org.gradle.api.Project
 
 fun Project.configureMediampMpvModule() {
@@ -10,5 +11,7 @@ fun Project.configureMediampMpvModule() {
     val desktopRuntimeJarTasks = registerDesktopRuntimeJarTasks(context)
     val prepareTask = registerMpvAndroidJniPackaging(context)
     wireMpvAndroidJniPackaging(context, prepareTask)
-    configureRuntimePublishing(context, desktopRuntimeJarTasks)
+    if (!isLocalCompositeMediamp()) {
+        configureRuntimePublishing(context, desktopRuntimeJarTasks)
+    }
 }

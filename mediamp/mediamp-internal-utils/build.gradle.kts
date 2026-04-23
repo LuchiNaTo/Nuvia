@@ -6,48 +6,47 @@
  * https://github.com/open-ani/mediamp/blob/main/LICENSE
  */
 
-import com.vanniktech.maven.publish.JavadocJar
-import com.vanniktech.maven.publish.KotlinMultiplatform
-import com.vanniktech.maven.publish.SourcesJar
+import localcomposite.configureAndroidNamespaceIfPresent
+import localcomposite.isLocalCompositeMediamp
 
 plugins {
     kotlin("multiplatform")
-    id("com.android.kotlin.multiplatform.library")
 
     `mpp-lib-targets`
     kotlin("plugin.serialization")
-    id(libs.plugins.vanniktech.mavenPublish.get().pluginId)
 }
 
 description = "MediaMP Internal Utils"
+val isLocalComposite = isLocalCompositeMediamp()
+val jvmTestSourceSetName = if (isLocalComposite) "desktopTest" else "jvmTest"
+
+if (!isLocalComposite) {
+    apply(plugin = "com.android.kotlin.multiplatform.library")
+}
 
 
 kotlin {
-    androidLibrary {
-        namespace = "org.openani.mediamp.internal.utils"
-        /*publishLibraryVariants("release")*/
-    }
+    configureAndroidNamespaceIfPresent("org.openani.mediamp.internal.utils")
     sourceSets {
         commonMain.dependencies {
         }
         commonTest.dependencies {
             implementation(kotlin("test"))
         }
-        getByName("jvmTest").dependencies {
+        getByName(jvmTestSourceSetName).dependencies {
             implementation(libs.junit)
         }
         desktopMain.dependencies {
         }
         iosMain.dependencies {
         }
-        androidMain.dependencies {
+        if (!isLocalComposite) {
+            androidMain.dependencies {
+            }
         }
     }
 }
 
-mavenPublishing {
-    configure(KotlinMultiplatform(JavadocJar.Empty(), SourcesJar.Sources(), listOf("debug", "release")))
-    publishToMavenCentral()
-    signAllPublicationsIfEnabled(project)
-    configurePom(project)
+if (!isLocalComposite) {
+    apply(from = rootProject.file("gradle/publishing/mediamp-internal-utils-publishing.gradle.kts"))
 }

@@ -9,6 +9,12 @@ private val isWindowsDesktop: Boolean by lazy {
     System.getProperty("os.name")?.lowercase()?.contains("windows") == true
 }
 
+private val nativeBridgeEnabled: Boolean by lazy {
+    (System.getProperty("nuvio.enableNativeBridge")
+        ?: System.getenv("NUVIO_ENABLE_NATIVE_BRIDGE"))
+        ?.toBooleanStrictOrNull() == true
+}
+
 internal interface DesktopMPVBridgeLib : Library {
     companion object {
         val INSTANCE: DesktopMPVBridgeLib by lazy {
@@ -169,20 +175,11 @@ internal interface DesktopMPVBridgeLib : Library {
 internal interface WindowsDesktopMPVBridgeLib : Library {
     companion object {
         private val loadedInstance: WindowsDesktopMPVBridgeLib? by lazy {
-            val userDir = System.getProperty("user.dir") ?: ""
-            val candidates = listOf(
-                File(userDir, "WindowsBridge/build/Release"),
-                File(userDir, "WindowsBridge/build/Debug"),
-                File(userDir, "../WindowsBridge/build/Release"),
-                File(userDir, "../WindowsBridge/build/Debug"),
-                File(userDir, "composeApp/build/bin/desktop/debugExecutable"),
-                File(userDir, "composeApp/build/bin/desktop/releaseExecutable"),
-            )
-            val libraryFile = candidates
-                .asSequence()
-                .filter { it.exists() && it.isDirectory }
-                .map { File(it, "NuvioWindowsBridge.dll") }
-                .firstOrNull { it.exists() && it.isFile }
+            if (!nativeBridgeEnabled) {
+                return@lazy null
+            }
+
+            val libraryFile = resolveExplicitLibraryFile()
 
             if (libraryFile != null) {
                 System.setProperty(
@@ -207,6 +204,23 @@ internal interface WindowsDesktopMPVBridgeLib : Library {
 
         val INSTANCE: WindowsDesktopMPVBridgeLib
             get() = loadedInstance ?: error("NuvioWindowsBridge.dll is not available")
+
+        private fun resolveExplicitLibraryFile(): File? {
+            val explicitLibraryPath = System.getProperty("nuvio.windowsBridge.path")
+                ?: System.getenv("NUVIO_WINDOWS_BRIDGE_DLL")
+            if (!explicitLibraryPath.isNullOrBlank()) {
+                return File(explicitLibraryPath).takeIf { it.exists() && it.isFile }
+            }
+
+            val explicitLibraryDir = System.getenv("NUVIO_WINDOWS_BRIDGE_DIR")
+                ?.takeIf { it.isNotBlank() }
+                ?.let(::File)
+                ?.takeIf { it.exists() && it.isDirectory }
+                ?: return null
+
+            return explicitLibraryDir.resolve("NuvioWindowsBridge.dll")
+                .takeIf { it.exists() && it.isFile }
+        }
     }
 
     fun nuvio_player_create(): Pointer

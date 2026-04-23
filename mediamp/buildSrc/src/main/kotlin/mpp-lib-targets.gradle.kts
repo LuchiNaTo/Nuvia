@@ -38,6 +38,7 @@ import kotlin.apply
  */
 
 val enableJvmTarget = project.findProperty("mediamp.jvm.target")?.toString()?.toBooleanStrict() ?: true
+val useDesktopJvmTarget = project.findProperty("mediamp.localComposite")?.toString()?.toBooleanStrictOrNull() == true
 
 val androidLibraryExtension = extensions.findByType(KotlinMultiplatformExtension::class)
     ?.extensions?.findByType(KotlinMultiplatformAndroidLibraryExtension::class)
@@ -124,12 +125,28 @@ kotlinMultiplatformExtension?.apply {
 
     } else {
         if (enableJvmTarget) {
-            jvm {
-                configureJvmOptions()
+            if (useDesktopJvmTarget) {
+                jvm("desktop") {
+                    configureJvmOptions()
+                }
+            } else {
+                jvm {
+                    configureJvmOptions()
+                }
             }
         }
 
-        applyDefaultHierarchyTemplate()
+        applyDefaultHierarchyTemplate {
+            common {
+                group("jvm") {
+                    withJvm()
+                }
+                group("skiko") {
+                    withJvm()
+                    withNative()
+                }
+            }
+        }
     }
 
     compilerOptions {

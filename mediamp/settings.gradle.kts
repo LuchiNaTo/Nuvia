@@ -8,6 +8,11 @@
 
 rootProject.name = "mediamp"
 
+val isLocalComposite = providers.gradleProperty("mediamp.localComposite")
+    .map { it.toBooleanStrictOrNull() ?: false }
+    .orElse(false)
+    .get()
+
 pluginManagement {
     repositories {
         gradlePluginPortal()
@@ -23,22 +28,20 @@ plugins {
 
 include(":mediamp-internal-utils")
 include(":mediamp-api")
-
-include(":mediamp-vlc")
-include(":mediamp-vlc-loader")
-include(":mediamp-exoplayer")
 include(":mediamp-mpv")
-include(":mediamp-avkit")
-
 include(":mediamp-ffmpeg")
-include(":mediamp-all")
 
-include(":mediamp-test")
-
-//include(":mediamp-preview")
-include(":mediamp-source-ktxio")
-
-include(":ci-helper")
-include(":catalog")
+if (!isLocalComposite) {
+    include(":mediamp-vlc")
+    include(":mediamp-vlc-loader")
+    include(":mediamp-exoplayer")
+    include(":mediamp-avkit")
+    include(":mediamp-all")
+    include(":mediamp-test")
+    //include(":mediamp-preview")
+    include(":mediamp-source-ktxio")
+    include(":ci-helper")
+    include(":catalog")
+}
 
 enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")

@@ -18,6 +18,11 @@ buildscript {
     }
 }
 
+val isLocalComposite = providers.gradleProperty("mediamp.localComposite")
+    .map { it.toBooleanStrictOrNull() ?: false }
+    .orElse(false)
+    .get()
+
 plugins {
     id(libs.plugins.kotlin.multiplatform.get().pluginId) apply false
     id(libs.plugins.kotlin.jvm.get().pluginId) apply false
@@ -29,7 +34,6 @@ plugins {
     id(libs.plugins.android.kotlin.multipaltform.library.get().pluginId) apply false
     id(libs.plugins.android.library.get().pluginId) apply false
     id(libs.plugins.android.application.get().pluginId) apply false
-    id(libs.plugins.vanniktech.mavenPublish.get().pluginId) apply false
     idea
 }
 

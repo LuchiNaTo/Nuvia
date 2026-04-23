@@ -1,15 +1,24 @@
 import org.gradle.api.DefaultTask
+import org.gradle.api.Project
 import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.FileSystemOperations
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.Internal
+import org.gradle.api.tasks.JavaExec
 import org.gradle.api.tasks.Optional
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.TaskAction
+import org.gradle.jvm.toolchain.JavaLanguageVersion
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask
+import org.jetbrains.compose.desktop.application.dsl.TargetFormat
+import org.jetbrains.compose.desktop.application.tasks.AbstractJvmToolOperationTask
+import java.io.File
 import java.util.Properties
+import javax.inject.Inject
 
 abstract class GenerateRuntimeConfigsTask : DefaultTask() {
     @get:OutputDirectory
@@ -105,30 +114,6 @@ abstract class GenerateRuntimeConfigsTask : DefaultTask() {
     }
 }
 
-abstract class RenameReleaseDmgTask : DefaultTask() {
-    @get:Input
-    abstract val versionName: Property<String>
-
-    @get:OutputDirectory
-    abstract val dmgDirectory: DirectoryProperty
-
-    @TaskAction
-    fun renameArtifact() {
-        val dmgDir = dmgDirectory.get().asFile
-        val targetFile = dmgDir.resolve("Nuvio-${versionName.get()}.dmg")
-        val sourceFile = dmgDir.listFiles()
-            ?.filter { it.extension == "dmg" && it.name.startsWith("Nuvio-") }
-            ?.maxByOrNull { it.lastModified() }
-            ?: error("No DMG output found in ${dmgDir.path}")
-
-        if (sourceFile.absolutePath != targetFile.absolutePath) {
-            targetFile.delete()
-            sourceFile.copyTo(targetFile, overwrite = true)
-            sourceFile.delete()
-        }
-    }
-}
-
 fun readXcconfigValue(file: File, key: String): String? {
     if (!file.exists()) return null
     return file.readLines()
@@ -141,6 +126,77 @@ fun readXcconfigValue(file: File, key: String): String? {
         }
         .firstOrNull { (entryKey, _) -> entryKey == key }
         ?.second
+}
+
+fun resolveWindowsRuntimeInputDir(project: Project): File {
+    val overridePath = project.providers.gradleProperty("nuvio.windowsRuntimeDir").orNull
+        ?: System.getenv("NUVIO_WINDOWS_RUNTIME_DIR")
+    return overridePath?.let(project::file) ?: project.file("vendor-runtime/windows-x64")
+}
+
+fun normalizeWindowsPackageVersion(versionName: String, versionCode: Int): String {
+    val numericSegments = versionName
+        .split('.', '-', '_')
+        .mapNotNull(String::toIntOrNull)
+        .take(4)
+        .toMutableList()
+
+    if (numericSegments.isEmpty()) {
+        return versionCode.toString()
+    }
+
+    while (numericSegments.size < 3) {
+        numericSegments += 0
+    }
+
+    return numericSegments.joinToString(".")
+}
+
+abstract class PrepareWindowsRuntimeTask : DefaultTask() {
+    @get:Internal
+    abstract val inputDir: DirectoryProperty
+
+    @get:Input
+    abstract val inputDirPath: Property<String>
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @get:Inject
+    abstract val fileSystemOperations: FileSystemOperations
+
+    @TaskAction
+    fun prepare() {
+        val inputDirectory = inputDir.get().asFile
+        if (!inputDirectory.isDirectory) {
+            error(
+                "Windows runtime directory not found at '${inputDirectory.absolutePath}'. " +
+                    "Place mediamp runtime JARs in composeApp/vendor-runtime/windows-x64 " +
+                    "or set -Pnuvio.windowsRuntimeDir / NUVIO_WINDOWS_RUNTIME_DIR.",
+            )
+        }
+
+        val runtimeJars = inputDirectory.listFiles()
+            ?.filter { it.isFile && it.extension.equals("jar", ignoreCase = true) }
+            ?.sortedBy(File::getName)
+            .orEmpty()
+
+        if (runtimeJars.isEmpty()) {
+            error(
+                "No Windows runtime JARs found in '${inputDirectory.absolutePath}'. " +
+                    "Bundle the mediamp runtime JARs before running or packaging the desktop app.",
+            )
+        }
+
+        val outputDirectory = outputDir.get().asFile
+        fileSystemOperations.delete {
+            delete(outputDirectory)
+        }
+        fileSystemOperations.copy {
+            from(runtimeJars)
+            into(outputDirectory)
+        }
+    }
 }
 
 plugins {
@@ -183,19 +239,61 @@ val iosDistributionSourceDir = if (iosDistribution == "full") {
 val iosFrameworkBundleId = "com.nuvio.media"
 val fullCommonSourceDir = project.file("src/fullCommonMain/kotlin")
 val generatedRuntimeConfigDir = layout.buildDirectory.dir("generated/runtime-config/kotlin")
+val windowsRuntimeInputDir = resolveWindowsRuntimeInputDir(project)
+val preparedWindowsRuntimeDir = layout.buildDirectory.dir("vendor-runtime/windows-x64")
+val java21Launcher = javaToolchains.launcherFor {
+    languageVersion.set(JavaLanguageVersion.of(21))
+}
+val java21Home = java21Launcher.map { it.metadata.installationPath.asFile.absolutePath }
+val windowsPackageVersion = normalizeWindowsPackageVersion(releaseAppVersionName, releaseAppVersionCode)
 
 val generateRuntimeConfigs = tasks.register<GenerateRuntimeConfigsTask>("generateRuntimeConfigs") {
     outputDir.set(generatedRuntimeConfigDir)
-    localPropertiesFile.set(rootProject.layout.projectDirectory.file("local.properties"))
+    val localProperties = rootProject.file("local.properties")
+    if (localProperties.exists()) {
+        localPropertiesFile.set(rootProject.layout.projectDirectory.file("local.properties"))
+    }
     appVersionName.set(releaseAppVersionName)
     appVersionCode.set(releaseAppVersionCode)
+}
+
+val prepareWindowsRuntime = tasks.register<PrepareWindowsRuntimeTask>("prepareWindowsRuntime") {
+    group = "distribution"
+    description = "Copy bundled mediamp Windows runtime JARs into the desktop build."
+    inputDir.set(layout.projectDirectory.dir(project.relativePath(windowsRuntimeInputDir)))
+    inputDirPath.set(windowsRuntimeInputDir.absolutePath)
+    outputDir.set(preparedWindowsRuntimeDir)
 }
 
 tasks.withType<KotlinCompilationTask<*>>().configureEach {
     dependsOn(generateRuntimeConfigs)
 }
 
+tasks.withType<AbstractJvmToolOperationTask>().configureEach {
+    javaHome.set(java21Home)
+}
+
+tasks.withType<JavaExec>().matching { it.name == "run" }.configureEach {
+    executable = java21Launcher.get().executablePath.asFile.absolutePath
+}
+
+tasks.matching {
+    it.name in setOf(
+        "run",
+        "createDistributable",
+        "createReleaseDistributable",
+        "packageDistributionForCurrentOS",
+        "packageReleaseDistributionForCurrentOS",
+        "packageExe",
+        "packageReleaseExe",
+    )
+}.configureEach {
+    dependsOn(prepareWindowsRuntime)
+}
+
 kotlin {
+    jvmToolchain(21)
+
     androidTarget {
         compilerOptions {
             jvmTarget.set(JvmTarget.JVM_11)
@@ -255,6 +353,14 @@ kotlin {
                 // mediamp-mpv for Windows desktop player
                 implementation("org.openani.mediamp:mediamp-api:0.1.0-dev-1")
                 implementation("org.openani.mediamp:mediamp-mpv:0.1.0-dev-1")
+                implementation(
+                    fileTree(
+                        mapOf(
+                            "dir" to preparedWindowsRuntimeDir.get().asFile,
+                            "include" to listOf("*.jar"),
+                        ),
+                    ),
+                )
             }
         }
         androidMain.dependencies {
@@ -323,48 +429,30 @@ compose.desktop {
     application {
         mainClass = "com.nuvio.app.DesktopAppKt"
 
-        // Add mediamp native library path for Windows
-        val mediampNativeBuildDir = rootProject.file("mediamp/mediamp-mpv/build-ci")
-        val mediampPrebuiltDir = rootProject.file("mediamp/mediamp-mpv/libmpv/lib/windows/x86_64")
-        jvmArgs(
-            "-Dskiko.renderApi=OPENGL",
-            "-Djava.library.path=" + listOf(
-                mediampNativeBuildDir.absolutePath,
-                mediampNativeBuildDir.resolve("Debug").absolutePath,
-                mediampNativeBuildDir.resolve("Release").absolutePath,
-                mediampPrebuiltDir.absolutePath,
-                System.getenv("NUVIO_MPV_DIR")?.let { "$it/bin" } ?: "",
-            ).filter { it.isNotEmpty() }.joinToString(System.getProperty("path.separator")),
-        )
-
         buildTypes.release.proguard {
             configurationFiles.from(project.file("desktop-proguard-rules.pro"))
         }
         nativeDistributions {
             packageName = "Nuvio"
+            packageVersion = windowsPackageVersion
+            description = "Nuvio desktop"
+            vendor = "Nuvio"
             modules("java.net.http")
-            targetFormats(org.jetbrains.compose.desktop.application.dsl.TargetFormat.Dmg)
-            macOS {
-                dockName = "Nuvio"
-                iconFile.set(project.file("desktop-icons/nuvio.icns"))
-                infoPlist {
-                    extraKeysRawXml = """
-                        <key>NSRequiresAquaSystemAppearance</key>
-                        <false/>
-                    """.trimIndent()
-                }
+            targetFormats(TargetFormat.Exe)
+            windows {
+                iconFile.set(project.file("desktop-icons/nuvio.ico"))
+                menu = true
+                menuGroup = "Nuvio"
+                shortcut = true
+                perUserInstall = true
+                dirChooser = true
+                console = false
+                upgradeUuid = "d4b3ae5b-bf39-45fa-87be-4327ad0f7fd8"
+                exePackageVersion = windowsPackageVersion
+                msiPackageVersion = windowsPackageVersion
             }
         }
     }
-}
-
-val renameReleaseDmgArtifact = tasks.register<RenameReleaseDmgTask>("renameReleaseDmgArtifact") {
-    versionName.set(releaseAppVersionName)
-    dmgDirectory.set(layout.buildDirectory.dir("compose/binaries/main-release/dmg"))
-}
-
-tasks.matching { it.name == "packageReleaseDistributionForCurrentOS" || it.name == "packageReleaseDmg" }.configureEach {
-    finalizedBy(renameReleaseDmgArtifact)
 }
 
 configurations.all {

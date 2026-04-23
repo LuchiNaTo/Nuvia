@@ -20,15 +20,7 @@ internal object DesktopPreferences {
     private val keyEncoder = Base64.getUrlEncoder().withoutPadding()
 
     private val rootDir: Path by lazy {
-        Paths.get(
-            System.getProperty("user.home"),
-            "Library",
-            "Application Support",
-            "Nuvio",
-            "preferences",
-        ).apply {
-            createDirectories()
-        }
+        DesktopPaths.preferencesRoot
     }
 
     private fun namespaceDir(namespace: String): Path =

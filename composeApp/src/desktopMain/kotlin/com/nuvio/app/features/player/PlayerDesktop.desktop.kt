@@ -11,6 +11,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
@@ -35,6 +36,9 @@ import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamItem
 import com.sun.jna.Native
 import com.sun.jna.Pointer
+import java.awt.Canvas
+import java.awt.event.HierarchyEvent
+import java.awt.event.HierarchyListener
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -46,9 +50,9 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.openani.mediamp.InternalMediampApi
 import org.openani.mediamp.PlaybackState
+import org.openani.mediamp.mpv.MPVHandle
 import org.openani.mediamp.features.PlaybackSpeed
 import org.openani.mediamp.mpv.MpvMediampPlayer
-import org.openani.mediamp.mpv.compose.MpvMediampPlayerSurface
 import org.openani.mediamp.source.UriMediaData
 
 private val isMacOS: Boolean by lazy {
@@ -89,17 +93,34 @@ actual fun PlatformPlayerSurface(
             onError = onError,
         )
     } else {
-        WindowsMpvPlayerSurface(
-            sourceUrl = sourceUrl,
-            sourceAudioUrl = sourceAudioUrl,
-            sourceHeaders = sourceHeaders,
-            modifier = modifier,
-            playWhenReady = playWhenReady,
-            resizeMode = resizeMode,
-            onControllerReady = onControllerReady,
-            onSnapshot = onSnapshot,
-            onError = onError,
-        )
+        if (hasWindowsNativeBridge) {
+            WindowsNativePlayerSurface(
+                sourceUrl = sourceUrl,
+                sourceAudioUrl = sourceAudioUrl,
+                sourceHeaders = sourceHeaders,
+                sourceResponseHeaders = sourceResponseHeaders,
+                useYoutubeChunkedPlayback = useYoutubeChunkedPlayback,
+                modifier = modifier,
+                playWhenReady = playWhenReady,
+                resizeMode = resizeMode,
+                useNativeController = useNativeController,
+                onControllerReady = onControllerReady,
+                onSnapshot = onSnapshot,
+                onError = onError,
+            )
+        } else {
+            WindowsMpvPlayerSurface(
+                sourceUrl = sourceUrl,
+                sourceAudioUrl = sourceAudioUrl,
+                sourceHeaders = sourceHeaders,
+                modifier = modifier,
+                playWhenReady = playWhenReady,
+                resizeMode = resizeMode,
+                onControllerReady = onControllerReady,
+                onSnapshot = onSnapshot,
+                onError = onError,
+            )
+        }
     }
 }
 
@@ -443,9 +464,36 @@ private fun WindowsMpvPlayerSurface(
     val player = remember {
         MpvMediampPlayer(Unit, kotlin.coroutines.EmptyCoroutineContext)
     }
+    val handle = remember(player) { player.impl as MPVHandle }
+    val renderSurface = remember {
+        Canvas().apply {
+            background = java.awt.Color.BLACK
+        }
+    }
 
-    DisposableEffect(player) {
+    DisposableEffect(player, renderSurface) {
+        val hierarchyListener = HierarchyListener { event ->
+            val displayabilityChanged =
+                event.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong() != 0L
+            if (displayabilityChanged && renderSurface.isDisplayable) {
+                runCatching { attachMpvRenderSurface(handle, renderSurface) }
+                    .onFailure { error ->
+                        onError(error.message ?: "Failed to attach MPV render surface")
+                    }
+            }
+        }
+
+        renderSurface.addHierarchyListener(hierarchyListener)
+        if (renderSurface.isDisplayable) {
+            runCatching { attachMpvRenderSurface(handle, renderSurface) }
+                .onFailure { error ->
+                    onError(error.message ?: "Failed to attach MPV render surface")
+                }
+        }
+
         onDispose {
+            renderSurface.removeHierarchyListener(hierarchyListener)
+            runCatching { detachMpvRenderSurface(handle) }
             player.close()
         }
     }
@@ -458,7 +506,7 @@ private fun WindowsMpvPlayerSurface(
 
             // Attach separate audio track if provided
             if (!sourceAudioUrl.isNullOrEmpty()) {
-                player.command("audio-add", sourceAudioUrl, "auto")
+                handle.command("audio-add", sourceAudioUrl, "auto")
             }
 
             if (playWhenReady) {
@@ -482,19 +530,19 @@ private fun WindowsMpvPlayerSurface(
     LaunchedEffect(resizeMode) {
         when (resizeMode) {
             PlayerResizeMode.Fit -> {
-                player.setProperty("panscan", 0.0)
-                player.setProperty("keepaspect", true)
+                handle.setProperty("panscan", 0.0)
+                handle.setProperty("keepaspect", true)
             }
             PlayerResizeMode.Fill, PlayerResizeMode.Zoom -> {
-                player.setProperty("panscan", 1.0)
-                player.setProperty("keepaspect", true)
+                handle.setProperty("panscan", 1.0)
+                handle.setProperty("keepaspect", true)
             }
         }
     }
 
     // Create controller
     val controller = remember(player) {
-        WindowsMpvController(player)
+        WindowsMpvController(player, handle)
     }
 
     LaunchedEffect(controller) {
@@ -533,10 +581,18 @@ private fun WindowsMpvPlayerSurface(
         }
     }
 
-    // Render surface: mpv renders directly into the Compose Canvas via OpenGL
-    MpvMediampPlayerSurface(
-        player = player,
+    SwingPanel(
+        factory = { renderSurface },
         modifier = modifier.background(Color.Black),
+        update = { surface ->
+            surface.background = java.awt.Color.BLACK
+            if (surface.isDisplayable) {
+                runCatching { attachMpvRenderSurface(handle, surface) }
+                    .onFailure { error ->
+                        onError(error.message ?: "Failed to attach MPV render surface")
+                    }
+            }
+        },
     )
 }
 
@@ -546,18 +602,19 @@ private fun WindowsMpvPlayerSurface(
  */
 private class WindowsMpvController(
     private val player: MpvMediampPlayer,
+    private val handle: MPVHandle,
 ) : PlayerEngineController {
 
     private val isReady: Boolean
-        get() = !player.isClosed && player.getCurrentPlaybackState() != PlaybackState.FINISHED
+        get() = player.getCurrentPlaybackState() != PlaybackState.FINISHED
 
-    override fun play() { if (!player.isClosed) player.resume() }
+    override fun play() { player.resume() }
 
-    override fun pause() { if (!player.isClosed) player.pause() }
+    override fun pause() { player.pause() }
 
-    override fun seekTo(positionMs: Long) { if (!player.isClosed) player.seekTo(positionMs) }
+    override fun seekTo(positionMs: Long) { player.seekTo(positionMs) }
 
-    override fun seekBy(offsetMs: Long) { if (!player.isClosed) player.skip(offsetMs) }
+    override fun seekBy(offsetMs: Long) { player.skip(offsetMs) }
 
     override fun retry() {
         player.resume()
@@ -569,15 +626,15 @@ private class WindowsMpvController(
 
     override fun getAudioTracks(): List<AudioTrack> {
         if (!isReady) return emptyList()
-        val count = player.getPropertyInt("track-list/count")
+        val count = handle.getPropertyInt("track-list/count")
         val tracks = mutableListOf<AudioTrack>()
         for (i in 0 until count) {
-            val type = player.getPropertyString("track-list/$i/type")
+            val type = handle.getPropertyString("track-list/$i/type")
             if (type != "audio") continue
-            val id = player.getPropertyInt("track-list/$i/id")
-            val title = player.getPropertyString("track-list/$i/title")
-            val lang = player.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
-            val selected = player.getPropertyBoolean("track-list/$i/selected")
+            val id = handle.getPropertyInt("track-list/$i/id")
+            val title = handle.getPropertyString("track-list/$i/title")
+            val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
+            val selected = handle.getPropertyBoolean("track-list/$i/selected")
             tracks.add(
                 AudioTrack(
                     index = tracks.size,
@@ -593,15 +650,15 @@ private class WindowsMpvController(
 
     override fun getSubtitleTracks(): List<SubtitleTrack> {
         if (!isReady) return emptyList()
-        val count = player.getPropertyInt("track-list/count")
+        val count = handle.getPropertyInt("track-list/count")
         val tracks = mutableListOf<SubtitleTrack>()
         for (i in 0 until count) {
-            val type = player.getPropertyString("track-list/$i/type")
+            val type = handle.getPropertyString("track-list/$i/type")
             if (type != "sub") continue
-            val id = player.getPropertyInt("track-list/$i/id")
-            val title = player.getPropertyString("track-list/$i/title")
-            val lang = player.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
-            val selected = player.getPropertyBoolean("track-list/$i/selected")
+            val id = handle.getPropertyInt("track-list/$i/id")
+            val title = handle.getPropertyString("track-list/$i/title")
+            val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
+            val selected = handle.getPropertyBoolean("track-list/$i/selected")
             tracks.add(
                 SubtitleTrack(
                     index = tracks.size,
@@ -618,34 +675,34 @@ private class WindowsMpvController(
     override fun selectAudioTrack(index: Int) {
         val tracks = getAudioTracks()
         if (index in tracks.indices) {
-            player.setProperty("aid", tracks[index].id)
+            handle.setProperty("aid", tracks[index].id)
         }
     }
 
     override fun selectSubtitleTrack(index: Int) {
         if (index < 0) {
-            player.setProperty("sid", "no")
+            handle.setProperty("sid", "no")
             return
         }
         val tracks = getSubtitleTracks()
         if (index in tracks.indices) {
-            player.setProperty("sid", tracks[index].id)
+            handle.setProperty("sid", tracks[index].id)
         }
     }
 
     override fun setSubtitleUri(url: String) {
-        player.command("sub-add", url, "auto")
+        handle.command("sub-add", url, "auto")
     }
 
     override fun clearExternalSubtitle() {
         if (!isReady) return
-        val count = player.getPropertyInt("track-list/count")
+        val count = handle.getPropertyInt("track-list/count")
         for (i in count - 1 downTo 0) {
-            val type = player.getPropertyString("track-list/$i/type")
-            val external = player.getPropertyBoolean("track-list/$i/external")
+            val type = handle.getPropertyString("track-list/$i/type")
+            val external = handle.getPropertyBoolean("track-list/$i/external")
             if (type == "sub" && external) {
-                val id = player.getPropertyInt("track-list/$i/id")
-                player.command("sub-remove", id.toString())
+                val id = handle.getPropertyInt("track-list/$i/id")
+                handle.command("sub-remove", id.toString())
                 return
             }
         }
@@ -660,31 +717,54 @@ private class WindowsMpvController(
         val colorHex = style.textColor.toMpvColorString()
         val outline = if (style.outlineEnabled) 2.0 else 0.0
         val subPos = 100 - style.bottomOffset
-        player.option("sub-color", colorHex)
-        player.setProperty("sub-border-size", outline)
-        player.setProperty("sub-font-size", style.fontSizeSp.toDouble())
-        player.setProperty("sub-pos", subPos)
+        handle.option("sub-color", colorHex)
+        handle.setProperty("sub-border-size", outline)
+        handle.setProperty("sub-font-size", style.fontSizeSp.toDouble())
+        handle.setProperty("sub-pos", subPos)
     }
 
     override fun switchSource(url: String, audioUrl: String?, headersJson: String?) {
         // Parse headers from JSON if provided
         if (headersJson != null) {
-            player.option("http-header-fields-clr", "")
+            handle.option("http-header-fields-clr", "")
             // Simple JSON parsing for header fields
             val headerPattern = Regex(""""([^"]+)"\s*:\s*"([^"]+)"""")
             headerPattern.findAll(headersJson).forEach { match ->
                 val (key, value) = match.destructured
-                player.option("http-header-fields", "$key: $value")
+                handle.option("http-header-fields", "$key: $value")
             }
         }
-        player.command("stop")
-        player.command("playlist-clear")
-        player.command("loadfile", url)
+        handle.command("stop")
+        handle.command("playlist-clear")
+        handle.command("loadfile", url)
         if (!audioUrl.isNullOrEmpty()) {
-            player.command("audio-add", audioUrl, "auto")
+            handle.command("audio-add", audioUrl, "auto")
         }
     }
 }
+
+private fun MPVHandle.setProperty(name: String, value: Boolean): Boolean =
+    setPropertyBoolean(name, value)
+
+private fun MPVHandle.setProperty(name: String, value: Double): Boolean =
+    setPropertyDouble(name, value)
+
+private fun MPVHandle.setProperty(name: String, value: Int): Boolean =
+    setPropertyInt(name, value)
+
+private fun MPVHandle.setProperty(name: String, value: String): Boolean =
+    setPropertyString(name, value)
+
+private fun attachMpvRenderSurface(
+    handle: MPVHandle,
+    surface: Canvas,
+): Boolean {
+    val nativePtr = Native.getComponentPointer(surface) ?: return false
+    return handle.option("wid", Pointer.nativeValue(nativePtr).toString())
+}
+
+private fun detachMpvRenderSurface(handle: MPVHandle): Boolean =
+    handle.option("wid", "0")
 
 // ──────────────────────────────────────────────────────────────────────────────
 // macOS: existing JNA bridge (unchanged)

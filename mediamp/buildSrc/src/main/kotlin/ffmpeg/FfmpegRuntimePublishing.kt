@@ -1,9 +1,5 @@
 package ffmpeg
 
-import com.vanniktech.maven.publish.JavadocJar
-import com.vanniktech.maven.publish.KotlinMultiplatform
-import com.vanniktech.maven.publish.SourcesJar
-import configurePom
 import nativebuild.DesktopRuntimeTarget
 import nativebuild.PublishedArtifact
 import nativebuild.addCompilePomDependency
@@ -20,7 +16,6 @@ import org.gradle.jvm.tasks.Jar
 import org.gradle.kotlin.dsl.create
 import org.gradle.kotlin.dsl.getByType
 import org.gradle.kotlin.dsl.register
-import signAllPublicationsIfEnabled
 
 private const val APPLE_XCFRAMEWORK_ARTIFACT_ID = "mediamp-ffmpeg-runtime-ios-xcframework"
 
@@ -121,13 +116,6 @@ internal fun configureRuntimePublishing(
 ) {
     val deployVersion = context.project.version.toString()
     val runtimeTargets = context.desktopRuntimeTargets
-
-    context.project.extensions.getByType<com.vanniktech.maven.publish.MavenPublishBaseExtension>().apply {
-        configure(KotlinMultiplatform(JavadocJar.Empty(), SourcesJar.Sources(), listOf("debug", "release")))
-        publishToMavenCentral()
-        signAllPublicationsIfEnabled(context.project)
-        configurePom(context.project)
-    }
 
     context.project.extensions.getByType<PublishingExtension>().publications.apply {
         desktopRuntimeJarTasks.forEach { (target, jarTask) ->

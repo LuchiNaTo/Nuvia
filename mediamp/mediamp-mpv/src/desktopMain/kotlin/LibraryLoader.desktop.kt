@@ -14,6 +14,7 @@ import java.nio.file.StandardCopyOption
 import java.util.Locale
 
 internal actual object LibraryLoader {
+    private const val cacheDirPropertyName = "mediamp.cache.dir"
     private val osName: String = System.getProperty("os.name").orEmpty().lowercase(Locale.ROOT)
     private val extractionLock = Any()
     private val loadLock = Any()
@@ -51,8 +52,8 @@ internal actual object LibraryLoader {
     }
 
     private fun extractNativeBinaries(): File {
-        val dir = Files.createTempDirectory("mediamp-mpv").toFile()
-        dir.deleteOnExit()
+        val dir = resolveExtractionDirectory()
+        dir.mkdirs()
 
         val classLoader = LibraryLoader::class.java.classLoader
         val manifest = classLoader.getResourceAsStream("mpv-natives.txt")
@@ -78,6 +79,34 @@ internal actual object LibraryLoader {
             }
         }
         return dir
+    }
+
+    private fun resolveExtractionDirectory(): File {
+        val cacheRoot = System.getProperty(cacheDirPropertyName)
+            ?.takeIf { it.isNotBlank() }
+            ?.let(::File)
+            ?: defaultWindowsCacheRoot()
+
+        if (cacheRoot != null) {
+            return cacheRoot.resolve("mediamp-mpv").apply { mkdirs() }
+        }
+
+        return Files.createTempDirectory("mediamp-mpv").toFile().apply {
+            deleteOnExit()
+        }
+    }
+
+    private fun defaultWindowsCacheRoot(): File? {
+        if (!osName.contains("win")) return null
+
+        val localAppData = System.getenv("LOCALAPPDATA")?.takeIf { it.isNotBlank() }
+        val userHome = System.getProperty("user.home")?.takeIf { it.isNotBlank() }
+
+        return when {
+            localAppData != null -> File(localAppData)
+            userHome != null -> File(userHome).resolve("AppData").resolve("Local")
+            else -> null
+        }?.resolve("Nuvio")?.resolve("cache")
     }
 
     private fun runtimeLibrariesInLoadOrder(runtimeDir: File): List<File> {

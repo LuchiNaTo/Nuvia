@@ -1,5 +1,6 @@
 package ffmpeg
 
+import localcomposite.isLocalCompositeMediamp
 import org.gradle.api.Project
 
 fun Project.configureMediampFfmpegModule() {
@@ -9,5 +10,7 @@ fun Project.configureMediampFfmpegModule() {
     val appleXcframeworkArtifact = registerAppleXcframeworkArtifact(context)
     val prepareTask = registerAndroidJniPackaging(context)
     wireAndroidJniPackaging(context, prepareTask)
-    configureRuntimePublishing(context, desktopRuntimeJarTasks, appleXcframeworkArtifact)
+    if (!isLocalCompositeMediamp()) {
+        configureRuntimePublishing(context, desktopRuntimeJarTasks, appleXcframeworkArtifact)
+    }
 }

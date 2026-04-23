@@ -6,30 +6,30 @@
  * https://github.com/open-ani/mediamp/blob/main/LICENSE
  */
 
-import com.vanniktech.maven.publish.JavadocJar
-import com.vanniktech.maven.publish.KotlinMultiplatform
-import com.vanniktech.maven.publish.SourcesJar
+import localcomposite.configureAndroidNamespaceIfPresent
+import localcomposite.isLocalCompositeMediamp
 
 plugins {
     kotlin("multiplatform")
-    id("com.android.kotlin.multiplatform.library")
     kotlin("plugin.compose")
     id("org.jetbrains.compose")
 
     `mpp-lib-targets`
     kotlin("plugin.serialization")
-    id(libs.plugins.vanniktech.mavenPublish.get().pluginId)
 }
 
 description = "Core API for MediaMP"
+val isLocalComposite = isLocalCompositeMediamp()
+val jvmTestSourceSetName = if (isLocalComposite) "desktopTest" else "jvmTest"
+
+if (!isLocalComposite) {
+    apply(plugin = "com.android.kotlin.multiplatform.library")
+}
 
 
 kotlin {
     explicitApi()
-    androidLibrary {
-        namespace = "org.openani.mediamp.api"
-        /*publishLibraryVariants("release")*/
-    }
+    configureAndroidNamespaceIfPresent("org.openani.mediamp.api")
     sourceSets {
         commonMain.dependencies {
             implementation(libs.kotlinx.io.core) // TODO: 2024/12/16 remove 
@@ -41,7 +41,7 @@ kotlin {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
         }
-        getByName("jvmTest").dependencies {
+        getByName(jvmTestSourceSetName).dependencies {
             implementation(libs.junit)
         }
         desktopMain.dependencies {
@@ -50,15 +50,14 @@ kotlin {
             implementation(libs.androidx.annotation)
             implementation(projects.mediampInternalUtils)
         }
-        androidMain.dependencies {
-            api(libs.androidx.annotation)
+        if (!isLocalComposite) {
+            androidMain.dependencies {
+                api(libs.androidx.annotation)
+            }
         }
     }
 }
 
-mavenPublishing {
-    configure(KotlinMultiplatform(JavadocJar.Empty(), SourcesJar.Sources(), listOf("debug", "release")))
-    publishToMavenCentral()
-    signAllPublicationsIfEnabled(project)
-    configurePom(project)
+if (!isLocalComposite) {
+    apply(from = rootProject.file("gradle/publishing/mediamp-api-publishing.gradle.kts"))
 }
