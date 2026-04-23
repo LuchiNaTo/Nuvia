@@ -5,6 +5,7 @@ import org.gradle.api.file.FileSystemOperations
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputDirectory
 import org.gradle.api.tasks.InputFile
 import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.JavaExec
@@ -240,7 +241,7 @@ fun normalizeWindowsPackageVersion(versionName: String, versionCode: Int): Strin
 }
 
 abstract class PrepareWindowsRuntimeTask : DefaultTask() {
-    @get:Internal
+    @get:InputDirectory
     abstract val inputDir: DirectoryProperty
 
     @get:Input
@@ -287,7 +288,8 @@ abstract class PrepareWindowsRuntimeTask : DefaultTask() {
 }
 
 abstract class SyncVendoredWindowsRuntimeTask : DefaultTask() {
-    @get:Internal
+    @get:Optional
+    @get:InputDirectory
     abstract val sourceDir: DirectoryProperty
 
     @get:Input
@@ -319,9 +321,21 @@ abstract class SyncVendoredWindowsRuntimeTask : DefaultTask() {
             return
         }
 
+        val outputDirectory = outputDir.get().asFile
+        fileSystemOperations.delete {
+            delete(
+                outputDirectory.listFiles()
+                    ?.filter { existing ->
+                        existing.isFile &&
+                            existing.extension.equals("jar", ignoreCase = true) &&
+                            Regex("""^mediamp-mpv-runtime-.*-windows-x64\.jar$""").matches(existing.name)
+                    }
+                    .orEmpty(),
+            )
+        }
         fileSystemOperations.copy {
             from(runtimeJars)
-            into(outputDir)
+            into(outputDirectory)
         }
     }
 }

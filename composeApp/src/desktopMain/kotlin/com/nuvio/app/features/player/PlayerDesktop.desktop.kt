@@ -37,14 +37,10 @@ import com.nuvio.app.features.streams.AddonStreamGroup
 import com.nuvio.app.features.streams.StreamItem
 import com.sun.jna.Native
 import com.sun.jna.Pointer
+import java.awt.BorderLayout
 import java.awt.Canvas
-import java.awt.Graphics
-import java.awt.event.HierarchyEvent
-import java.awt.event.HierarchyListener
-import java.awt.event.ComponentAdapter
-import java.awt.event.ComponentEvent
-import javax.swing.SwingUtilities
 import java.util.Locale
+import javax.swing.JPanel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -468,6 +464,7 @@ private fun WindowsNativePlayerSurface(
 private data class WindowsMpvSession(
     val player: MpvMediampPlayer,
     val handle: MPVHandle,
+    val renderHost: JPanel,
     val renderSurface: Canvas,
 )
 
@@ -515,22 +512,20 @@ private fun WindowsMpvPlayerSurface(
             val player = MpvMediampPlayer(Unit, kotlin.coroutines.EmptyCoroutineContext)
             val handle = player.impl as? MPVHandle
                 ?: error("mediamp player did not expose an MPVHandle")
+            val renderSurface = Canvas().apply {
+                background = java.awt.Color.BLACK
+                isFocusable = false
+                ignoreRepaint = true
+            }
             WindowsMpvSession(
                 player = player,
                 handle = handle,
-                // We must NOT let AWT paint over the HWND: mpv renders with D3D11
-                // directly to the native window, and any GDI paint() or update()
-                // call from AWT will blank the D3D11 swap chain. We therefore
-                // ignore all repaint events and make paint()/update() no-ops so
-                // mpv owns the rendering of this window.
-                renderSurface = object : Canvas() {
-                    override fun paint(g: Graphics?) { /* mpv owns this surface */ }
-                    override fun update(g: Graphics?) { /* mpv owns this surface */ }
-                }.apply {
+                renderHost = JPanel(BorderLayout()).apply {
                     background = java.awt.Color.BLACK
-                    isFocusable = false
-                    ignoreRepaint = true
+                    isOpaque = true
+                    add(renderSurface, BorderLayout.CENTER)
                 },
+                renderSurface = renderSurface,
             )
         }
     }
@@ -593,36 +588,13 @@ private fun WindowsMpvPlayerSurface(
 
     val player = session.player
     val handle = session.handle
+    val renderHost = session.renderHost
     val renderSurface = session.renderSurface
 
     DisposableEffect(player, renderSurface) {
-        val hierarchyListener = HierarchyListener { event ->
-            val changed = event.changeFlags and HierarchyEvent.DISPLAYABILITY_CHANGED.toLong() != 0L
-            if (changed) {
-                SwingUtilities.invokeLater {
-                    renderSurface.repaint()
-                }
-            }
-        }
-
-        val componentListener = object : ComponentAdapter() {
-            override fun componentShown(e: ComponentEvent?) {
-                renderSurface.repaint()
-            }
-
-            override fun componentResized(e: ComponentEvent?) {
-                renderSurface.repaint()
-            }
-        }
-
-        renderSurface.addHierarchyListener(hierarchyListener)
-        renderSurface.addComponentListener(componentListener)
-
         onDispose {
             sessionClosed = true
             surfaceAttached = false
-            renderSurface.removeHierarchyListener(hierarchyListener)
-            renderSurface.removeComponentListener(componentListener)
             runCatching { detachMpvRenderSurface(handle) }
             runCatching { player.close() }
         }
@@ -651,6 +623,7 @@ private fun WindowsMpvPlayerSurface(
         if (!surfaceAttached || fatalErrorMessage != null || sessionClosed) return@LaunchedEffect
 
         try {
+            currentOnError(null)
             withContext(Dispatchers.IO) {
                 DesktopRuntimeDiagnostics.info(
                     tag = "PlayerDesktop",
@@ -698,34 +671,18 @@ private fun WindowsMpvPlayerSurface(
                     )
                 }
 
-                // Wait briefly for mpv to settle, then dump the rendering state.
-                // This tells us whether the VO is configured against our HWND,
-                // whether a video track is recognized, and whether decoding has
-                // actually started. All reads are guarded: if mpv refuses a
-                // property we just log empty, never throw.
-                kotlinx.coroutines.delay(1500)
-                fun readProp(name: String): String = runCatching {
-                    handle.getPropertyString(name)
-                }.getOrElse { it.message ?: "<error>" }
-                DesktopRuntimeDiagnostics.info(
-                    tag = "PlayerDesktop",
-                    message = "mpv state dump: " +
-                        "wid=${readProp("wid")}, " +
-                        "vo=${readProp("vo")}, " +
-                        "current-vo=${readProp("current-vo")}, " +
-                        "gpu-context=${readProp("gpu-context")}, " +
-                        "width=${readProp("width")}, " +
-                        "height=${readProp("height")}, " +
-                        "dwidth=${readProp("dwidth")}, " +
-                        "dheight=${readProp("dheight")}, " +
-                        "video-codec=${readProp("video-codec")}, " +
-                        "hwdec-current=${readProp("hwdec-current")}, " +
-                        "pause=${readProp("pause")}, " +
-                        "core-idle=${readProp("core-idle")}, " +
-                        "idle-active=${readProp("idle-active")}, " +
-                        "eof-reached=${readProp("eof-reached")}, " +
-                        "mpv-version=${readProp("mpv-version")}",
-                )
+                if (playWhenReady) {
+                    kotlinx.coroutines.delay(2500)
+                    val startupState = handle.readWindowsMpvStartupState(player)
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "mpv state dump: ${startupState.toLogMessage()}",
+                    )
+
+                    check(!startupState.indicatesFailedStartup()) {
+                        "mpv stayed idle after startup; ${startupState.toLogMessage()}"
+                    }
+                }
             }
         } catch (e: Throwable) {
             reportFatalFailure("media load", e)
@@ -828,10 +785,12 @@ private fun WindowsMpvPlayerSurface(
     }
 
     SwingPanel(
-        factory = { renderSurface },
+        factory = { renderHost },
         modifier = modifier.background(Color.Black),
-        update = { surface ->
-            surface.background = java.awt.Color.BLACK
+        update = { host ->
+            host.background = java.awt.Color.BLACK
+            renderSurface.background = java.awt.Color.BLACK
+            host.revalidate()
         },
     )
 }
@@ -1020,6 +979,85 @@ private fun MPVHandle.setProperty(name: String, value: Int): Boolean =
 
 private fun MPVHandle.setProperty(name: String, value: String): Boolean =
     setPropertyString(name, value)
+
+private data class WindowsMpvStartupState(
+    val playbackState: PlaybackState,
+    val wid: String?,
+    val vo: String?,
+    val currentVo: String?,
+    val gpuContext: String?,
+    val width: String?,
+    val height: String?,
+    val dwidth: String?,
+    val dheight: String?,
+    val videoCodec: String?,
+    val audioCodec: String?,
+    val hwdecCurrent: String?,
+    val pause: String?,
+    val coreIdle: String?,
+    val idleActive: String?,
+    val eofReached: String?,
+    val path: String?,
+    val streamOpenFilename: String?,
+    val trackCount: String?,
+    val mpvVersion: String?,
+)
+
+private fun MPVHandle.readPropertyStringOrNull(name: String): String? =
+    runCatching {
+        getPropertyString(name)
+            .trim()
+            .takeUnless { it.isEmpty() || it.equals("null", ignoreCase = true) }
+    }.getOrNull()
+
+private fun MPVHandle.readWindowsMpvStartupState(player: MpvMediampPlayer): WindowsMpvStartupState =
+    WindowsMpvStartupState(
+        playbackState = player.getCurrentPlaybackState(),
+        wid = readPropertyStringOrNull("wid"),
+        vo = readPropertyStringOrNull("vo"),
+        currentVo = readPropertyStringOrNull("current-vo"),
+        gpuContext = readPropertyStringOrNull("gpu-context"),
+        width = readPropertyStringOrNull("width"),
+        height = readPropertyStringOrNull("height"),
+        dwidth = readPropertyStringOrNull("dwidth"),
+        dheight = readPropertyStringOrNull("dheight"),
+        videoCodec = readPropertyStringOrNull("video-codec"),
+        audioCodec = readPropertyStringOrNull("audio-codec-name"),
+        hwdecCurrent = readPropertyStringOrNull("hwdec-current"),
+        pause = readPropertyStringOrNull("pause"),
+        coreIdle = readPropertyStringOrNull("core-idle"),
+        idleActive = readPropertyStringOrNull("idle-active"),
+        eofReached = readPropertyStringOrNull("eof-reached"),
+        path = readPropertyStringOrNull("path"),
+        streamOpenFilename = readPropertyStringOrNull("stream-open-filename"),
+        trackCount = readPropertyStringOrNull("track-list/count"),
+        mpvVersion = readPropertyStringOrNull("mpv-version"),
+    )
+
+private fun WindowsMpvStartupState.indicatesFailedStartup(): Boolean =
+    coreIdle.equals("yes", ignoreCase = true) && idleActive.equals("yes", ignoreCase = true)
+
+private fun WindowsMpvStartupState.toLogMessage(): String =
+    "playbackState=$playbackState, " +
+        "wid=${wid ?: "<blank>"}, " +
+        "vo=${vo ?: "<blank>"}, " +
+        "current-vo=${currentVo ?: "<blank>"}, " +
+        "gpu-context=${gpuContext ?: "<blank>"}, " +
+        "width=${width ?: "<blank>"}, " +
+        "height=${height ?: "<blank>"}, " +
+        "dwidth=${dwidth ?: "<blank>"}, " +
+        "dheight=${dheight ?: "<blank>"}, " +
+        "video-codec=${videoCodec ?: "<blank>"}, " +
+        "audio-codec=${audioCodec ?: "<blank>"}, " +
+        "hwdec-current=${hwdecCurrent ?: "<blank>"}, " +
+        "pause=${pause ?: "<blank>"}, " +
+        "core-idle=${coreIdle ?: "<blank>"}, " +
+        "idle-active=${idleActive ?: "<blank>"}, " +
+        "eof-reached=${eofReached ?: "<blank>"}, " +
+        "path=${path ?: "<blank>"}, " +
+        "stream-open-filename=${streamOpenFilename ?: "<blank>"}, " +
+        "track-list/count=${trackCount ?: "<blank>"}, " +
+        "mpv-version=${mpvVersion ?: "<blank>"}"
 
 /**
  * Safe replacement for [MPVHandle.getPropertyInt].

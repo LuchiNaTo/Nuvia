@@ -114,6 +114,10 @@ internal class FfmpegBuildContext(
         add("--enable-protocol=pipe")
         add("--enable-protocol=concat")
         add("--enable-protocol=crypto")
+        add("--enable-protocol=tcp")
+        add("--enable-protocol=tls")
+        add("--enable-protocol=http")
+        add("--enable-protocol=https")
         add("--enable-parser=h264")
         add("--enable-parser=hevc")
         add("--enable-parser=av1")
@@ -133,7 +137,6 @@ internal class FfmpegBuildContext(
         add("--enable-swresample")
         add("--enable-swscale")
         add("--disable-debug")
-        add("--disable-network")
         add("--disable-autodetect")
     }
 

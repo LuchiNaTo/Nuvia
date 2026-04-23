@@ -106,6 +106,7 @@ internal fun FfmpegBuildContext.windowsTarget(): FfmpegBuildTarget = FfmpegBuild
     extraFlags = listOf(
         "--arch=x86_64",
         "--target-os=mingw32",
+        "--enable-schannel",
         "--cc=${msys2Dir.resolve("ucrt64/bin/gcc.exe").absolutePath.toMsysPath()}",
         "--cxx=${msys2Dir.resolve("ucrt64/bin/g++.exe").absolutePath.toMsysPath()}",
     ),

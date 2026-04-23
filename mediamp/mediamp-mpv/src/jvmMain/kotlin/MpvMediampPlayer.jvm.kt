@@ -30,6 +30,11 @@ actual class MpvMediampPlayer (
     class MPVPlayerData(mediaData: MediaData) : Data(mediaData)
 
     private val handle = MPVHandle(context)
+
+    private fun hasOpenedMedia(): Boolean = openResource.value != null
+
+    private fun canApplyObservedPlaybackState(): Boolean =
+        hasOpenedMedia() && playbackState.value >= PlaybackState.READY
     
     private val eventListener = object : EventListener {
         override fun onPropertyChange(name: String) {
@@ -37,18 +42,36 @@ actual class MpvMediampPlayer (
         }
 
         override fun onPropertyChange(name: String, value: Boolean) {
+            if (!canApplyObservedPlaybackState()) return
+
             when (name) {
-                "pause" -> playbackState.value = 
-                    if (value) PlaybackState.PAUSED else PlaybackState.PLAYING
+                "pause" -> playbackState.value =
+                    if (value) {
+                        PlaybackState.PAUSED
+                    } else if (playbackState.value != PlaybackState.PAUSED_BUFFERING) {
+                        PlaybackState.PLAYING
+                    } else {
+                        PlaybackState.PAUSED_BUFFERING
+                    }
                 "paused-for-cache" -> playbackState.value =
-                    if (value) PlaybackState.PAUSED_BUFFERING else PlaybackState.PLAYING
-                
+                    if (value) {
+                        PlaybackState.PAUSED_BUFFERING
+                    } else if (playbackState.value != PlaybackState.PAUSED) {
+                        PlaybackState.PLAYING
+                    } else {
+                        PlaybackState.PAUSED
+                    }
             }
         }
 
         override fun onPropertyChange(name: String, value: Long) {
             when (name) {
-                "time-pos/full" -> currentPositionMillis.value = value * 1000
+                "time-pos/full" -> {
+                    currentPositionMillis.value = value * 1000
+                    if (canApplyObservedPlaybackState() && playbackState.value != PlaybackState.PAUSED) {
+                        playbackState.value = PlaybackState.PLAYING
+                    }
+                }
                 "duration/full" -> mediaProperties.value =
                     if (mediaProperties.value == null) MediaProperties(null, value * 1000)
                     else mediaProperties.value?.copy(durationMillis = value * 1000)
@@ -164,6 +187,9 @@ actual class MpvMediampPlayer (
     override suspend fun setMediaDataImpl(data: MediaData): MPVPlayerData = when (data) {
         is UriMediaData -> {
             val headers = data.headers
+
+            currentPositionMillis.value = 0L
+            mediaProperties.value = null
             
             // 清除播放列表
             handle.command("stop")
@@ -188,8 +214,13 @@ actual class MpvMediampPlayer (
                 val media = openResource.value ?: return
                 when (val data = media.mediaData) {
                     is UriMediaData -> {
-                        handle.command("loadfile", data.uri)
+                        val loadStarted = handle.command("loadfile", data.uri)
+                        if (!loadStarted) {
+                            playbackState.value = PlaybackState.ERROR
+                            return
+                        }
                         handle.setPropertyBoolean("pause", false)
+                        playbackState.value = PlaybackState.PAUSED_BUFFERING
                     }
                     is SeekableInputMediaData -> TODO()
                     else -> { }
