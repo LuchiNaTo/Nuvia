@@ -728,15 +728,35 @@ private fun WindowsMpvPlayerSurface(
                 }
 
                 if (playWhenReady) {
-                    kotlinx.coroutines.delay(2500)
-                    val startupState = handle.readWindowsMpvStartupState(player)
+                    val interopBlendingEnabled =
+                        System.getProperty("compose.interop.blending")?.equals("true", ignoreCase = true) == true
+
+                    delay(2500)
+                    var startupState = handle.readWindowsMpvStartupState(player)
                     DesktopRuntimeDiagnostics.info(
                         tag = "PlayerDesktop",
-                        message = "mpv state dump: ${startupState.toLogMessage()}",
+                        message = "mpv startup probe #1: ${startupState.toLogMessage()}",
                     )
+
+                    if (startupState.indicatesStalledVideoStartup()) {
+                        delay(8000)
+                        startupState = handle.readWindowsMpvStartupState(player)
+                        DesktopRuntimeDiagnostics.info(
+                            tag = "PlayerDesktop",
+                            message = "mpv startup probe #2: ${startupState.toLogMessage()}",
+                        )
+                    }
+
+                    if (interopBlendingEnabled && startupState.usesDirectXContext()) {
+                        error("Unsupported mpv gpu context for Compose interop blending: ${startupState.toLogMessage()}")
+                    }
 
                     check(!startupState.indicatesFailedStartup()) {
                         "mpv stayed idle after startup; ${startupState.toLogMessage()}"
+                    }
+
+                    check(!startupState.indicatesStalledVideoStartup()) {
+                        "mpv did not expose a usable video output after startup; ${startupState.toLogMessage()}"
                     }
                 }
             }
@@ -1067,6 +1087,8 @@ private data class WindowsMpvStartupState(
     val vo: String?,
     val currentVo: String?,
     val gpuContext: String?,
+    val currentGpuContext: String?,
+    val gpuApi: String?,
     val width: String?,
     val height: String?,
     val dwidth: String?,
@@ -1098,6 +1120,8 @@ private fun MPVHandle.readWindowsMpvStartupState(player: MpvMediampPlayer): Wind
         vo = readPropertyStringOrNull("vo"),
         currentVo = readPropertyStringOrNull("current-vo"),
         gpuContext = readPropertyStringOrNull("gpu-context"),
+        currentGpuContext = readPropertyStringOrNull("current-gpu-context"),
+        gpuApi = readPropertyStringOrNull("gpu-api"),
         width = readPropertyStringOrNull("width"),
         height = readPropertyStringOrNull("height"),
         dwidth = readPropertyStringOrNull("dwidth"),
@@ -1118,12 +1142,28 @@ private fun MPVHandle.readWindowsMpvStartupState(player: MpvMediampPlayer): Wind
 private fun WindowsMpvStartupState.indicatesFailedStartup(): Boolean =
     coreIdle.equals("yes", ignoreCase = true) && idleActive.equals("yes", ignoreCase = true)
 
+private fun WindowsMpvStartupState.usesDirectXContext(): Boolean {
+    val context = currentGpuContext ?: gpuContext
+    return context?.contains("d3d11", ignoreCase = true) == true
+}
+
+private fun WindowsMpvStartupState.indicatesStalledVideoStartup(): Boolean {
+    val noVideoOutput = currentVo.isNullOrBlank()
+    val noTracks = trackCount.isNullOrBlank() || trackCount == "0"
+    val noVideoMetrics = width.isNullOrBlank() && dwidth.isNullOrBlank() && videoCodec.isNullOrBlank()
+    val loadingState = playbackState == PlaybackState.PAUSED_BUFFERING || playbackState == PlaybackState.READY
+    val stillIdle = coreIdle.equals("yes", ignoreCase = true)
+    return noVideoOutput && noTracks && noVideoMetrics && loadingState && stillIdle
+}
+
 private fun WindowsMpvStartupState.toLogMessage(): String =
     "playbackState=$playbackState, " +
         "wid=${wid ?: "<blank>"}, " +
         "vo=${vo ?: "<blank>"}, " +
         "current-vo=${currentVo ?: "<blank>"}, " +
         "gpu-context=${gpuContext ?: "<blank>"}, " +
+        "current-gpu-context=${currentGpuContext ?: "<blank>"}, " +
+        "gpu-api=${gpuApi ?: "<blank>"}, " +
         "width=${width ?: "<blank>"}, " +
         "height=${height ?: "<blank>"}, " +
         "dwidth=${dwidth ?: "<blank>"}, " +

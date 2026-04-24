@@ -128,7 +128,8 @@ actual class MpvMediampPlayer (
                 handle.option("ao", "audiotrack,opensles")
             }
             is Platform.Windows -> {
-                handle.option("gpu-context", "d3d11")
+                handle.option("gpu-context", "win")
+                handle.option("gpu-api", "opengl")
                 handle.option("opengl-es", "no")
                 handle.option("ao", "wasapi")
             }
