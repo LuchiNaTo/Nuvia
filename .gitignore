@@ -2,6 +2,8 @@
 .kotlin
 .gradle
 **/build/
+!composeApp/src/**/kotlin/com/nuvio/app/core/build/
+!composeApp/src/**/kotlin/com/nuvio/app/core/build/**
 xcuserdata
 !src/**/build/
 local.properties
@@ -31,3 +33,6 @@ replay_pid25104.log
 .vscode/mcp.json
 .aider*
 .claude
+tools
+AGENTS.md
+MPVKit~5fb414ea2f6286f728bb07b84bd70725be59e182

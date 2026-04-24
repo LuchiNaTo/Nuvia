@@ -82,7 +82,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.rememberModalBottomSheetState
 import coil3.compose.AsyncImage
-import com.nuvio.app.core.ui.nuvioPlatformExtraBottomPadding
+import com.nuvio.app.core.ui.nuvioSafeBottomPadding
 import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import kotlinx.coroutines.launch
 import kotlin.math.round
@@ -131,7 +131,9 @@ fun StreamsScreen(
     } else {
         watchProgressUiState.byVideoId[videoId]
     }
-    val storedProgressFraction = storedProgress?.progressPercent
+    val storedProgressFraction = storedProgress
+        ?.takeIf { it.isResumable }
+        ?.progressPercent
         ?.takeIf { it > 0f }
         ?.let { explicitPercent -> (explicitPercent / 100f).coerceIn(0f, 1f) }
     val effectiveResumeProgressFraction = if (startFromBeginning) {
@@ -148,7 +150,7 @@ fun StreamsScreen(
         if (startFromBeginning) {
             null
         } else {
-            (resumePositionMs ?: storedProgress?.lastPositionMs)?.takeIf { it > 0L }
+            (resumePositionMs ?: storedProgress?.takeIf { it.isResumable }?.lastPositionMs)?.takeIf { it > 0L }
         }
     }
 
@@ -762,7 +764,7 @@ internal fun StreamList(
                     }
                 }
                 item {
-                    Spacer(modifier = Modifier.height(nuvioPlatformExtraBottomPadding + 80.dp))
+                    Spacer(modifier = Modifier.height(nuvioSafeBottomPadding(80.dp)))
                 }
             }
         }
@@ -1002,7 +1004,7 @@ private fun StreamActionsSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(bottom = 16.dp + nuvioPlatformExtraBottomPadding),
+                .padding(bottom = nuvioSafeBottomPadding(16.dp)),
         ) {
             Column(
                 modifier = Modifier

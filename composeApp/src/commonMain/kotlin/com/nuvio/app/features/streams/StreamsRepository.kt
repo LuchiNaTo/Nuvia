@@ -3,10 +3,12 @@ package com.nuvio.app.features.streams
 import co.touchlab.kermit.Logger
 import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.features.addons.AddonRepository
+import com.nuvio.app.features.addons.buildAddonResourceUrl
 import com.nuvio.app.features.addons.httpGetText
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.plugins.PluginRepository
+import com.nuvio.app.features.plugins.pluginContentId
 import com.nuvio.app.features.plugins.PluginsUiState
 import com.nuvio.app.features.plugins.PluginRepositoryItem
 import com.nuvio.app.features.plugins.PluginRuntimeResult
@@ -237,11 +239,12 @@ object StreamsRepository {
 
             streamAddons.forEach { addon ->
                 launch {
-                    val encodedId = videoId.encodeForPath()
-                    val baseUrl = addon.manifest.transportUrl
-                        .substringBefore("?")
-                        .removeSuffix("/manifest.json")
-                    val url = "$baseUrl/stream/$type/$encodedId.json"
+                    val url = buildAddonResourceUrl(
+                        manifestUrl = addon.manifest.transportUrl,
+                        resource = "stream",
+                        type = type,
+                        id = videoId,
+                    )
                     log.d { "Fetching streams from: $url" }
 
                     val displayName = addon.addonName
@@ -283,7 +286,11 @@ object StreamsRepository {
                     launch {
                         val completion = PluginRepository.executeScraper(
                             scraper = scraper,
-                            tmdbId = videoId.toPluginTmdbId(),
+                            tmdbId = pluginContentId(
+                                videoId = videoId,
+                                season = season,
+                                episode = episode,
+                            ),
                             mediaType = type,
                             season = season,
                             episode = episode,
@@ -420,10 +427,6 @@ object StreamsRepository {
         activeRequestKey = null
         _uiState.value = StreamsUiState()
     }
-
-    // Encode id segment so colons and slashes don't break URL path parsing on addons
-    private fun String.encodeForPath(): String =
-        replace("%", "%25").replace(" ", "%20")
 }
 
 private data class InstalledStreamAddonTarget(
@@ -485,14 +488,6 @@ private fun List<AddonStreamGroup>.toEmptyStateReason(anyLoading: Boolean): Stre
         StreamsEmptyStateReason.StreamFetchFailed
     } else {
         StreamsEmptyStateReason.NoStreamsFound
-    }
-}
-
-private fun String.toPluginTmdbId(): String {
-    return when {
-        startsWith("tmdb:") -> removePrefix("tmdb:").substringBefore(":").ifBlank { this }
-        startsWith("tmdb/") -> removePrefix("tmdb/").substringBefore('/').ifBlank { this }
-        else -> this
     }
 }
 
