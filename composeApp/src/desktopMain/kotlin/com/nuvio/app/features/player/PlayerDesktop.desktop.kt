@@ -30,6 +30,7 @@ import com.nuvio.app.core.sync.encodeSyncFloat
 import com.nuvio.app.core.sync.encodeSyncInt
 import com.nuvio.app.core.sync.encodeSyncString
 import com.nuvio.app.core.sync.encodeSyncStringSet
+import com.nuvio.app.desktop.DesktopPaths
 import com.nuvio.app.desktop.DesktopRuntimeDiagnostics
 import com.nuvio.app.desktop.DesktopPreferences
 import com.nuvio.app.features.details.MetaVideo
@@ -38,9 +39,13 @@ import com.nuvio.app.features.streams.StreamItem
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import java.awt.BorderLayout
-import java.awt.Canvas
+import java.awt.Component
+import java.awt.Panel
+import java.net.HttpURLConnection
+import java.net.URI
 import java.util.Locale
 import javax.swing.JPanel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -52,7 +57,7 @@ import kotlinx.serialization.json.put
 import org.openani.mediamp.InternalMediampApi
 import org.openani.mediamp.PlaybackState
 import org.openani.mediamp.mpv.MPVHandle
-import org.openani.mediamp.features.PlaybackSpeed
+import org.openani.mediamp.mpv.MpvMediampPlayerInitOptions
 import org.openani.mediamp.mpv.MpvMediampPlayer
 import org.openani.mediamp.source.UriMediaData
 
@@ -62,6 +67,10 @@ private val isMacOS: Boolean by lazy {
 
 private val hasWindowsNativeBridge: Boolean
     get() = !isMacOS && WindowsDesktopMPVBridgeLib.isAvailable
+
+private const val DESKTOP_PLAYBACK_USER_AGENT =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -465,8 +474,22 @@ private data class WindowsMpvSession(
     val player: MpvMediampPlayer,
     val handle: MPVHandle,
     val renderHost: JPanel,
-    val renderSurface: Canvas,
+    val renderSurface: Component,
 )
+
+private fun closeWindowsMpvSessionAsync(session: WindowsMpvSession?) {
+    if (session == null) return
+    Thread(
+        {
+            runCatching { detachMpvRenderSurface(session.handle) }
+            runCatching { session.player.close() }
+        },
+        "Nuvio-mpv-close",
+    ).apply {
+        isDaemon = true
+        start()
+    }
+}
 
 private object DesktopPlayerGestureBridge {
     private val lock = Any()
@@ -554,31 +577,33 @@ private fun WindowsMpvPlayerSurface(
 
     var fatalErrorMessage by remember { mutableStateOf<String?>(null) }
     var surfaceAttached by remember { mutableStateOf(false) }
-    var attachAttempted by remember { mutableStateOf(false) }
     var sessionClosed by remember { mutableStateOf(false) }
 
-    val sessionResult = remember {
-        runCatching {
-            val player = MpvMediampPlayer(Unit, kotlin.coroutines.EmptyCoroutineContext)
-            val handle = player.impl as? MPVHandle
-                ?: error("mediamp player did not expose an MPVHandle")
-            val renderSurface = Canvas().apply {
-                background = java.awt.Color.BLACK
-                isFocusable = false
-                ignoreRepaint = true
-            }
-            WindowsMpvSession(
-                player = player,
-                handle = handle,
-                renderHost = JPanel(BorderLayout()).apply {
-                    background = java.awt.Color.BLACK
-                    isOpaque = true
-                    add(renderSurface, BorderLayout.CENTER)
-                },
-                renderSurface = renderSurface,
-            )
+    val renderSurface = remember {
+        object : Panel(BorderLayout()) {
+            override fun paint(g: java.awt.Graphics?) = Unit
+
+            override fun update(g: java.awt.Graphics?) = Unit
+        }.apply {
+            background = java.awt.Color.BLACK
+            isFocusable = false
+            ignoreRepaint = true
         }
     }
+    val renderHost = remember(renderSurface) {
+        JPanel(BorderLayout()).apply {
+            background = java.awt.Color.BLACK
+            isOpaque = true
+            add(renderSurface, BorderLayout.CENTER)
+        }
+    }
+    val mpvLogFile = remember {
+        DesktopPaths.logsRoot
+            .resolve("mpv-${System.currentTimeMillis()}.log")
+            .toAbsolutePath()
+            .normalize()
+    }
+    var sessionResult by remember { mutableStateOf<Result<WindowsMpvSession>?>(null) }
 
     fun reportFatalFailure(
         phase: String,
@@ -598,10 +623,7 @@ private fun WindowsMpvPlayerSurface(
         surfaceAttached = false
 
         if (!sessionClosed) {
-            sessionResult.getOrNull()?.let { session ->
-                runCatching { detachMpvRenderSurface(session.handle) }
-                runCatching { session.player.close() }
-            }
+            closeWindowsMpvSessionAsync(sessionResult?.getOrNull())
             sessionClosed = true
         }
 
@@ -609,8 +631,10 @@ private fun WindowsMpvPlayerSurface(
         currentOnError(message)
     }
 
-    LaunchedEffect(sessionResult.exceptionOrNull()) {
-        sessionResult.exceptionOrNull()?.let { error ->
+    val sessionFailure = sessionResult?.exceptionOrNull()
+
+    LaunchedEffect(sessionFailure) {
+        sessionFailure?.let { error ->
             reportFatalFailure("initialization", error)
         }
     }
@@ -626,8 +650,48 @@ private fun WindowsMpvPlayerSurface(
         }
     }
 
-    val session = sessionResult.getOrNull()
-    if (session == null || fatalErrorMessage != null || sessionClosed) {
+    LaunchedEffect(renderSurface, fatalErrorMessage, sessionClosed) {
+        if (fatalErrorMessage != null || sessionClosed || sessionResult != null) return@LaunchedEffect
+
+        try {
+            val wid = awaitMpvRenderSurfaceWindowIdOrThrow(renderSurface)
+            val result = runCatching {
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "mpv native log file=$mpvLogFile",
+                )
+                val player = MpvMediampPlayer(
+                    MpvMediampPlayerInitOptions(
+                        platformContext = Unit,
+                        windowId = wid,
+                        logFilePath = mpvLogFile.toString(),
+                    ),
+                    kotlin.coroutines.EmptyCoroutineContext,
+                )
+                val handle = player.impl as? MPVHandle
+                    ?: error("mediamp player did not expose an MPVHandle")
+                WindowsMpvSession(
+                    player = player,
+                    handle = handle,
+                    renderHost = renderHost,
+                    renderSurface = renderSurface,
+                )
+            }
+            sessionResult = result
+            result.getOrThrow()
+            surfaceAttached = true
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "MPV initialized with pre-attached render surface.",
+            )
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            reportFatalFailure("pre-initialize render-surface attach", e)
+        }
+    }
+
+    val session = sessionResult?.getOrNull()
+    if (fatalErrorMessage != null || sessionClosed) {
         Box(
             modifier = modifier
                 .fillMaxSize()
@@ -636,10 +700,21 @@ private fun WindowsMpvPlayerSurface(
         return
     }
 
+    if (session == null) {
+        SwingPanel(
+            factory = { renderHost },
+            modifier = modifier.background(Color.Black),
+            update = { host ->
+                host.background = java.awt.Color.BLACK
+                renderSurface.background = java.awt.Color.BLACK
+                host.revalidate()
+            },
+        )
+        return
+    }
+
     val player = session.player
     val handle = session.handle
-    val renderHost = session.renderHost
-    val renderSurface = session.renderSurface
 
     DisposableEffect(player, renderSurface) {
         DesktopPlayerGestureBridge.register(
@@ -651,27 +726,7 @@ private fun WindowsMpvPlayerSurface(
             DesktopPlayerGestureBridge.unregister(player)
             sessionClosed = true
             surfaceAttached = false
-            runCatching { detachMpvRenderSurface(handle) }
-            runCatching { player.close() }
-        }
-    }
-
-    LaunchedEffect(renderSurface, handle, fatalErrorMessage) {
-        if (fatalErrorMessage != null) return@LaunchedEffect
-        if (sessionClosed) return@LaunchedEffect
-        if (attachAttempted) return@LaunchedEffect
-
-        attachAttempted = true
-
-        try {
-            attachMpvRenderSurfaceOrThrow(handle, renderSurface)
-            surfaceAttached = true
-            DesktopRuntimeDiagnostics.info(
-                tag = "PlayerDesktop",
-                message = "MPV render surface attached successfully.",
-            )
-        } catch (e: Throwable) {
-            reportFatalFailure("render-surface attach", e)
+            closeWindowsMpvSessionAsync(session)
         }
     }
 
@@ -687,6 +742,14 @@ private fun WindowsMpvPlayerSurface(
                 )
 
                 val headers = sourceHeaders.toMutableMap()
+                if (headers.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
+                    headers["User-Agent"] = DESKTOP_PLAYBACK_USER_AGENT
+                }
+
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "Source preflight: ${preflightDesktopStream(sourceUrl, headers)}",
+                )
 
                 DesktopRuntimeDiagnostics.info(
                     tag = "PlayerDesktop",
@@ -731,36 +794,49 @@ private fun WindowsMpvPlayerSurface(
                     val interopBlendingEnabled =
                         System.getProperty("compose.interop.blending")?.equals("true", ignoreCase = true) == true
 
-                    delay(2500)
-                    var startupState = handle.readWindowsMpvStartupState(player)
-                    DesktopRuntimeDiagnostics.info(
-                        tag = "PlayerDesktop",
-                        message = "mpv startup probe #1: ${startupState.toLogMessage()}",
-                    )
-
-                    if (startupState.indicatesStalledVideoStartup()) {
-                        delay(8000)
+                    var startupState: WindowsMpvStartupState? = null
+                    var videoRecoveryAttempted = false
+                    var probeIndex = 0
+                    var elapsedMs = 0L
+                    val startupDeadlineMs = 75_000L
+                    while (elapsedMs < startupDeadlineMs) {
+                        val probeDelayMs = if (probeIndex == 0) 2500L else 5000L
+                        delay(probeDelayMs)
+                        elapsedMs += probeDelayMs
+                        probeIndex += 1
                         startupState = handle.readWindowsMpvStartupState(player)
                         DesktopRuntimeDiagnostics.info(
                             tag = "PlayerDesktop",
-                            message = "mpv startup probe #2: ${startupState.toLogMessage()}",
+                            message = "mpv startup probe #$probeIndex/${startupDeadlineMs / 1000}s: ${startupState?.toLogMessage()}",
                         )
+                        if (!videoRecoveryAttempted && startupState?.indicatesAudioOnlyVideoFailure() == true) {
+                            videoRecoveryAttempted = true
+                            recoverWindowsMpvVideoOutput(handle, startupState)
+                            continue
+                        }
+                        if (startupState?.hasUsablePlaybackStartup() == true) {
+                            break
+                        }
                     }
 
-                    if (interopBlendingEnabled && startupState.usesDirectXContext()) {
-                        error("Unsupported mpv gpu context for Compose interop blending: ${startupState.toLogMessage()}")
+                    val finalStartupState = startupState
+                        ?: handle.readWindowsMpvStartupState(player)
+
+                    if (interopBlendingEnabled && finalStartupState.usesDirectXContext()) {
+                        error("Unsupported mpv gpu context for Compose interop blending: ${finalStartupState.toLogMessage()}")
                     }
 
-                    check(!startupState.indicatesFailedStartup()) {
-                        "mpv stayed idle after startup; ${startupState.toLogMessage()}"
+                    check(!finalStartupState.indicatesFailedStartup()) {
+                        "mpv stayed idle after startup; ${finalStartupState.toLogMessage()}"
                     }
 
-                    check(!startupState.indicatesStalledVideoStartup()) {
-                        "mpv did not expose a usable video output after startup; ${startupState.toLogMessage()}"
+                    check(!finalStartupState.indicatesStalledVideoStartup()) {
+                        "mpv did not expose a usable video output after startup; ${finalStartupState.toLogMessage()}"
                     }
                 }
             }
         } catch (e: Throwable) {
+            if (e is CancellationException) throw e
             reportFatalFailure("media load", e)
         }
     }
@@ -837,7 +913,7 @@ private fun WindowsMpvPlayerSurface(
                 positionMs = position,
                 durationMs = props?.durationMillis?.takeIf { it > 0 } ?: 0L,
                 bufferedPositionMs = 0L,
-                playbackSpeed = player.features[PlaybackSpeed]?.value ?: 1.0f,
+                playbackSpeed = handle.readPlaybackSpeed(),
             )
         }.collectLatest { snapshot ->
             currentOnSnapshot(snapshot)
@@ -905,7 +981,8 @@ private class WindowsMpvController(
 
     override fun setPlaybackSpeed(speed: Float) {
         runCatching {
-            player.features[PlaybackSpeed]?.set(speed)
+            val normalizedSpeed = speed.coerceIn(0.25f, 4f)
+            handle.setPropertyDouble("speed", normalizedSpeed.toDouble())
         }
     }
 
@@ -916,12 +993,12 @@ private class WindowsMpvController(
             val count = handle.getPropertyIntSafe("track-list/count")
             val tracks = mutableListOf<AudioTrack>()
             for (i in 0 until count) {
-                val type = handle.getPropertyString("track-list/$i/type")
+                val type = handle.readPropertyStringOrNull("track-list/$i/type")
                 if (type != "audio") continue
                 val id = handle.getPropertyIntSafe("track-list/$i/id")
-                val title = handle.getPropertyString("track-list/$i/title")
-                val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
-                val selected = handle.getPropertyBoolean("track-list/$i/selected")
+                val title = handle.readPropertyStringOrNull("track-list/$i/title").orEmpty()
+                val lang = handle.readPropertyStringOrNull("track-list/$i/lang")
+                val selected = runCatching { handle.getPropertyBoolean("track-list/$i/selected") }.getOrDefault(false)
                 tracks.add(
                     AudioTrack(
                         index = tracks.size,
@@ -942,12 +1019,13 @@ private class WindowsMpvController(
             val count = handle.getPropertyIntSafe("track-list/count")
             val tracks = mutableListOf<SubtitleTrack>()
             for (i in 0 until count) {
-                val type = handle.getPropertyString("track-list/$i/type")
+                val type = handle.readPropertyStringOrNull("track-list/$i/type")
                 if (type != "sub") continue
                 val id = handle.getPropertyIntSafe("track-list/$i/id")
-                val title = handle.getPropertyString("track-list/$i/title")
-                val lang = handle.getPropertyString("track-list/$i/lang").takeIf { it.isNotBlank() }
-                val selected = handle.getPropertyBoolean("track-list/$i/selected")
+                val title = handle.readPropertyStringOrNull("track-list/$i/title").orEmpty()
+                val lang = handle.readPropertyStringOrNull("track-list/$i/lang")
+                val selected = runCatching { handle.getPropertyBoolean("track-list/$i/selected") }.getOrDefault(false)
+                val forced = runCatching { handle.getPropertyBoolean("track-list/$i/forced") }.getOrDefault(false)
                 tracks.add(
                     SubtitleTrack(
                         index = tracks.size,
@@ -955,6 +1033,7 @@ private class WindowsMpvController(
                         label = title.ifEmpty { lang ?: "Subtitle $id" },
                         language = lang,
                         isSelected = selected,
+                        isForced = forced,
                     ),
                 )
             }
@@ -1026,20 +1105,29 @@ private class WindowsMpvController(
 
     override fun switchSource(url: String, audioUrl: String?, headersJson: String?) {
         runCatching {
+            handle.option("user-agent", DESKTOP_PLAYBACK_USER_AGENT)
             if (headersJson != null) {
                 handle.option("http-header-fields-clr", "")
                 val headerPattern = Regex(""""([^"]+)"\s*:\s*"([^"]+)"""")
                 headerPattern.findAll(headersJson).forEach { match ->
                     val (key, value) = match.destructured
+                    if (key.equals("User-Agent", ignoreCase = true)) {
+                        handle.option("user-agent", value)
+                        return@forEach
+                    }
                     handle.option("http-header-fields", "$key: $value")
                 }
             }
             handle.command("stop")
             handle.command("playlist-clear")
+            handle.setPropertyString("vid", "auto")
+            handle.setPropertyString("aid", "auto")
+            handle.setPropertyString("sid", "auto")
             handle.command("loadfile", url)
             if (!audioUrl.isNullOrEmpty()) {
                 handle.command("audio-add", audioUrl, "auto")
             }
+            handle.setPropertyBoolean("pause", false)
         }
     }
 }
@@ -1081,6 +1169,12 @@ private fun MPVHandle.writeVolumeLevel(level: Float): PlayerAudioLevel? {
     )
 }
 
+private fun MPVHandle.readPlaybackSpeed(): Float =
+    readPropertyStringOrNull("speed")
+        ?.toFloatOrNull()
+        ?.takeIf { it.isFinite() && it > 0f }
+        ?: 1f
+
 private data class WindowsMpvStartupState(
     val playbackState: PlaybackState,
     val wid: String?,
@@ -1095,7 +1189,22 @@ private data class WindowsMpvStartupState(
     val dheight: String?,
     val videoCodec: String?,
     val audioCodec: String?,
+    val timePosition: String?,
+    val duration: String?,
+    val percentPosition: String?,
     val hwdecCurrent: String?,
+    val ao: String?,
+    val currentAo: String?,
+    val audioDevice: String?,
+    val audioParams: String?,
+    val videoParams: String?,
+    val selectedVideoId: String?,
+    val selectedAudioId: String?,
+    val selectedSubtitleId: String?,
+    val pausedForCache: String?,
+    val cacheBufferingState: String?,
+    val volume: String?,
+    val mute: String?,
     val pause: String?,
     val coreIdle: String?,
     val idleActive: String?,
@@ -1103,6 +1212,7 @@ private data class WindowsMpvStartupState(
     val path: String?,
     val streamOpenFilename: String?,
     val trackCount: String?,
+    val trackSummary: String?,
     val mpvVersion: String?,
 )
 
@@ -1127,8 +1237,23 @@ private fun MPVHandle.readWindowsMpvStartupState(player: MpvMediampPlayer): Wind
         dwidth = readPropertyStringOrNull("dwidth"),
         dheight = readPropertyStringOrNull("dheight"),
         videoCodec = readPropertyStringOrNull("video-codec"),
-        audioCodec = readPropertyStringOrNull("audio-codec-name"),
+        audioCodec = readPropertyStringOrNull("audio-codec-name") ?: readSelectedAudioCodec(),
+        timePosition = readPropertyStringOrNull("time-pos/full") ?: readPropertyStringOrNull("time-pos"),
+        duration = readPropertyStringOrNull("duration/full") ?: readPropertyStringOrNull("duration"),
+        percentPosition = readPropertyStringOrNull("percent-pos"),
         hwdecCurrent = readPropertyStringOrNull("hwdec-current"),
+        ao = readPropertyStringOrNull("ao"),
+        currentAo = readPropertyStringOrNull("current-ao"),
+        audioDevice = readPropertyStringOrNull("audio-device"),
+        audioParams = readPropertyStringOrNull("audio-params"),
+        videoParams = readPropertyStringOrNull("video-params"),
+        selectedVideoId = readPropertyStringOrNull("vid"),
+        selectedAudioId = readPropertyStringOrNull("aid"),
+        selectedSubtitleId = readPropertyStringOrNull("sid"),
+        pausedForCache = readPropertyStringOrNull("paused-for-cache"),
+        cacheBufferingState = readPropertyStringOrNull("cache-buffering-state"),
+        volume = readPropertyStringOrNull("volume"),
+        mute = readPropertyStringOrNull("mute"),
         pause = readPropertyStringOrNull("pause"),
         coreIdle = readPropertyStringOrNull("core-idle"),
         idleActive = readPropertyStringOrNull("idle-active"),
@@ -1136,11 +1261,51 @@ private fun MPVHandle.readWindowsMpvStartupState(player: MpvMediampPlayer): Wind
         path = readPropertyStringOrNull("path"),
         streamOpenFilename = readPropertyStringOrNull("stream-open-filename"),
         trackCount = readPropertyStringOrNull("track-list/count"),
+        trackSummary = readTrackSummary(),
         mpvVersion = readPropertyStringOrNull("mpv-version"),
     )
 
+private fun MPVHandle.readSelectedAudioCodec(): String? {
+    val selectedAudioId = readPropertyStringOrNull("aid") ?: return null
+    val count = readPropertyStringOrNull("track-list/count")?.toIntOrNull() ?: return null
+    for (index in 0 until count.coerceAtMost(32)) {
+        val type = readPropertyStringOrNull("track-list/$index/type")
+        val selected = readPropertyStringOrNull("track-list/$index/selected")
+        val id = readPropertyStringOrNull("track-list/$index/id")
+        if (type == "audio" && selected.equals("yes", ignoreCase = true) && id == selectedAudioId) {
+            return readPropertyStringOrNull("track-list/$index/codec")
+        }
+    }
+    return null
+}
+
+private fun MPVHandle.readTrackSummary(): String? {
+    val count = readPropertyStringOrNull("track-list/count")?.toIntOrNull() ?: return null
+    if (count <= 0) return null
+
+    return (0 until count.coerceAtMost(16)).joinToString(separator = " | ") { index ->
+        val type = readPropertyStringOrNull("track-list/$index/type") ?: "?"
+        val selected = readPropertyStringOrNull("track-list/$index/selected") ?: "?"
+        val id = readPropertyStringOrNull("track-list/$index/id") ?: "?"
+        val codec = readPropertyStringOrNull("track-list/$index/codec") ?: "?"
+        val lang = readPropertyStringOrNull("track-list/$index/lang") ?: "?"
+        "#$index:$type:id=$id:selected=$selected:codec=$codec:lang=$lang"
+    }
+}
+
 private fun WindowsMpvStartupState.indicatesFailedStartup(): Boolean =
     coreIdle.equals("yes", ignoreCase = true) && idleActive.equals("yes", ignoreCase = true)
+
+private fun WindowsMpvStartupState.hasUsablePlaybackStartup(): Boolean {
+    val trackCountValue = trackCount?.toIntOrNull() ?: 0
+    return playbackState == PlaybackState.PLAYING ||
+        trackCountValue > 0 ||
+        !timePosition.isNullOrBlank() ||
+        !duration.isNullOrBlank() ||
+        !audioParams.isNullOrBlank() ||
+        !videoParams.isNullOrBlank() ||
+        !currentVo.isNullOrBlank()
+}
 
 private fun WindowsMpvStartupState.usesDirectXContext(): Boolean {
     val context = currentGpuContext ?: gpuContext
@@ -1151,9 +1316,78 @@ private fun WindowsMpvStartupState.indicatesStalledVideoStartup(): Boolean {
     val noVideoOutput = currentVo.isNullOrBlank()
     val noTracks = trackCount.isNullOrBlank() || trackCount == "0"
     val noVideoMetrics = width.isNullOrBlank() && dwidth.isNullOrBlank() && videoCodec.isNullOrBlank()
+    val hasVideoTrack = trackSummary?.contains(":video:", ignoreCase = true) == true
+    val videoDisabled = selectedVideoId.equals("no", ignoreCase = true)
     val loadingState = playbackState == PlaybackState.PAUSED_BUFFERING || playbackState == PlaybackState.READY
     val stillIdle = coreIdle.equals("yes", ignoreCase = true)
-    return noVideoOutput && noTracks && noVideoMetrics && loadingState && stillIdle
+    return (noVideoOutput && noTracks && noVideoMetrics && loadingState && stillIdle) ||
+        (hasVideoTrack && noVideoOutput && noVideoMetrics && videoDisabled)
+}
+
+private fun WindowsMpvStartupState.indicatesAudioOnlyVideoFailure(): Boolean {
+    val hasLoadedMedia = !path.isNullOrBlank() || !streamOpenFilename.isNullOrBlank()
+    val hasVideoTrack = trackSummary?.contains(":video:", ignoreCase = true) == true
+    val videoDisabled = selectedVideoId.equals("no", ignoreCase = true)
+    val noVideoOutput = currentVo.isNullOrBlank() && videoParams.isNullOrBlank()
+    return hasLoadedMedia && hasVideoTrack && videoDisabled && noVideoOutput
+}
+
+private suspend fun recoverWindowsMpvVideoOutput(
+    handle: MPVHandle,
+    state: WindowsMpvStartupState?,
+) {
+    val targetVo = state?.vo?.takeIf { it.isNotBlank() } ?: "gpu"
+    DesktopRuntimeDiagnostics.warn(
+        tag = "PlayerDesktop",
+        message = "mpv loaded audio but disabled video; forcing video track and rebuilding VO. state=${state?.toLogMessage()}",
+    )
+    runCatching { handle.setPropertyString("vid", "auto") }
+    runCatching { handle.setPropertyString("vo", "null") }
+    delay(250)
+    runCatching { handle.setPropertyString("vo", targetVo) }
+    runCatching { handle.command("video-reload") }
+    runCatching { handle.setPropertyBoolean("pause", false) }
+}
+
+private fun preflightDesktopStream(
+    sourceUrl: String,
+    headers: Map<String, String>,
+): String {
+    var connection: HttpURLConnection? = null
+    return runCatching {
+        connection = (URI(sourceUrl).toURL().openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            instanceFollowRedirects = true
+            connectTimeout = 12_000
+            readTimeout = 12_000
+            setRequestProperty(
+                "User-Agent",
+                headers.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
+                    ?: DESKTOP_PLAYBACK_USER_AGENT,
+            )
+            headers.forEach { (key, value) ->
+                if (key.equals("Range", ignoreCase = true)) return@forEach
+                if (key.equals("User-Agent", ignoreCase = true)) return@forEach
+                setRequestProperty(key, value)
+            }
+            setRequestProperty("Range", "bytes=0-0")
+        }
+
+        val status = connection!!.responseCode
+        val stream = if (status >= 400) connection!!.errorStream else connection!!.inputStream
+        val firstByteRead = stream?.use { it.read(ByteArray(1)) } ?: -1
+        val finalUrl = connection!!.url
+        "status=$status, host=${finalUrl.host}, " +
+            "contentType=${connection!!.contentType ?: "<blank>"}, " +
+            "contentLength=${connection!!.contentLengthLong}, " +
+            "acceptRanges=${connection!!.getHeaderField("Accept-Ranges") ?: "<blank>"}, " +
+            "contentRange=${connection!!.getHeaderField("Content-Range") ?: "<blank>"}, " +
+            "firstByteRead=$firstByteRead"
+    }.getOrElse { throwable ->
+        "failed=${throwable::class.simpleName}: ${throwable.message ?: "<no message>"}"
+    }.also {
+        connection?.disconnect()
+    }
 }
 
 private fun WindowsMpvStartupState.toLogMessage(): String =
@@ -1170,7 +1404,22 @@ private fun WindowsMpvStartupState.toLogMessage(): String =
         "dheight=${dheight ?: "<blank>"}, " +
         "video-codec=${videoCodec ?: "<blank>"}, " +
         "audio-codec=${audioCodec ?: "<blank>"}, " +
+        "time-pos=${timePosition ?: "<blank>"}, " +
+        "duration=${duration ?: "<blank>"}, " +
+        "percent-pos=${percentPosition ?: "<blank>"}, " +
         "hwdec-current=${hwdecCurrent ?: "<blank>"}, " +
+        "ao=${ao ?: "<blank>"}, " +
+        "current-ao=${currentAo ?: "<blank>"}, " +
+        "audio-device=${audioDevice ?: "<blank>"}, " +
+        "audio-params=${audioParams ?: "<blank>"}, " +
+        "video-params=${videoParams ?: "<blank>"}, " +
+        "vid=${selectedVideoId ?: "<blank>"}, " +
+        "aid=${selectedAudioId ?: "<blank>"}, " +
+        "sid=${selectedSubtitleId ?: "<blank>"}, " +
+        "paused-for-cache=${pausedForCache ?: "<blank>"}, " +
+        "cache-buffering-state=${cacheBufferingState ?: "<blank>"}, " +
+        "volume=${volume ?: "<blank>"}, " +
+        "mute=${mute ?: "<blank>"}, " +
         "pause=${pause ?: "<blank>"}, " +
         "core-idle=${coreIdle ?: "<blank>"}, " +
         "idle-active=${idleActive ?: "<blank>"}, " +
@@ -1178,6 +1427,7 @@ private fun WindowsMpvStartupState.toLogMessage(): String =
         "path=${path ?: "<blank>"}, " +
         "stream-open-filename=${streamOpenFilename ?: "<blank>"}, " +
         "track-list/count=${trackCount ?: "<blank>"}, " +
+        "tracks=${trackSummary ?: "<blank>"}, " +
         "mpv-version=${mpvVersion ?: "<blank>"}"
 
 /**
@@ -1201,73 +1451,34 @@ private fun MPVHandle.getPropertyIntSafe(name: String): Int {
     return raw.trim().toIntOrNull() ?: 0
 }
 
-private fun attachMpvRenderSurface(
-    handle: MPVHandle,
-    surface: Canvas,
-): Boolean {
-    if (!surface.isDisplayable) return false
-    if (!surface.isShowing) return false
-    if (surface.width <= 0 || surface.height <= 0) return false
+private fun readMpvRenderSurfaceWindowId(surface: Component): Long? {
+    if (!surface.isDisplayable) return null
+    if (!surface.isShowing) return null
+    if (surface.width <= 0 || surface.height <= 0) return null
 
-    val nativePtr = Native.getComponentPointer(surface) ?: return false
-    val wid = Pointer.nativeValue(nativePtr)
-    if (wid == 0L) return false
-
-    DesktopRuntimeDiagnostics.info(
-        tag = "PlayerDesktop",
-        message = "Attempting MPV surface attach: displayable=${surface.isDisplayable}, showing=${surface.isShowing}, size=${surface.width}x${surface.height}, wid=$wid",
-    )
-
-    // NOTE: The native `set_option` wrapper in mediamp-mpv has an inverted return
-    // value (it returns the raw `mpv_set_option_string` int cast to bool, so 0 =
-    // success becomes `false`). We therefore cannot use `handle.option(...)` when
-    // we need to observe success. `setPropertyString` wraps `mpv_set_property`
-    // with a correct `>= 0` check and, since mpv 0.21 / client API 1.23, most
-    // options — including "wid" — can be set via the property API even after
-    // `mpv_initialize()` (which `MpvMediampPlayer` calls from its constructor).
-    val ok = handle.setPropertyString("wid", wid.toString())
-    if (!ok) {
-        // Fallback: try the legacy option API. Even if its Kotlin return is
-        // inverted, calling it is harmless — subsequent surface attach logic
-        // will confirm embedding via rendering.
-        runCatching { handle.option("wid", wid.toString()) }
-    }
-
-    // Force the VO to rebuild so it picks up the freshly-set `wid`. mpv's
-    // documentation warns that changing `wid` at runtime "may or may not work";
-    // toggling `vo` is the reliable trick to trigger a clean reconfigure of
-    // the video output against the new window. Errors here are non-fatal.
-    runCatching {
-        handle.setPropertyString("vo", "null")
-        handle.setPropertyString("vo", "gpu-next")
-    }
-    return true
+    val nativePtr = Native.getComponentPointer(surface) ?: return null
+    return Pointer.nativeValue(nativePtr).takeIf { it != 0L }
 }
 
-private suspend fun attachMpvRenderSurfaceOrThrow(
-    handle: MPVHandle,
-    surface: Canvas,
-) {
-    repeat(30) { attempt ->
-        val attached = withContext(Dispatchers.Main) {
-            attachMpvRenderSurface(handle, surface)
+private suspend fun awaitMpvRenderSurfaceWindowIdOrThrow(surface: Component): Long {
+    repeat(60) { attempt ->
+        val wid = withContext(Dispatchers.Main) {
+            readMpvRenderSurfaceWindowId(surface)
         }
-        if (attached) {
+        if (wid != null) {
             DesktopRuntimeDiagnostics.info(
                 tag = "PlayerDesktop",
-                message = "MPV render surface attached successfully on attempt ${attempt + 1}.",
+                message = "MPV render surface ready before player init on attempt ${attempt + 1}: displayable=${surface.isDisplayable}, showing=${surface.isShowing}, size=${surface.width}x${surface.height}, wid=$wid",
             )
-            return
+            return wid
         }
         delay(50)
     }
 
-    error("Failed to attach MPV render surface to a native window.")
+    error("Failed to obtain native MPV render surface window before player initialization.")
 }
 
 private fun detachMpvRenderSurface(handle: MPVHandle): Boolean {
-    // Same inverted-return caveat as in `attachMpvRenderSurface` — prefer the
-    // property API and fall back silently if unsupported.
     val ok = runCatching { handle.setPropertyString("wid", "0") }.getOrDefault(false)
     if (!ok) {
         runCatching { handle.option("wid", "0") }

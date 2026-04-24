@@ -22,6 +22,12 @@ import org.openani.mediamp.source.SeekableInputMediaData
 import org.openani.mediamp.source.UriMediaData
 import kotlin.coroutines.CoroutineContext
 
+data class MpvMediampPlayerInitOptions(
+    val platformContext: Any,
+    val windowId: Long? = null,
+    val logFilePath: String? = null,
+)
+
 @kotlin.OptIn(InternalMediampApi::class)
 actual class MpvMediampPlayer (
     context: Any,
@@ -29,7 +35,9 @@ actual class MpvMediampPlayer (
 ) : AbstractMediampPlayer<MpvMediampPlayer.MPVPlayerData>(parentCoroutineContext) {
     class MPVPlayerData(mediaData: MediaData) : Data(mediaData)
 
-    private val handle = MPVHandle(context)
+    private val initOptions = context as? MpvMediampPlayerInitOptions
+    private val handle = MPVHandle(initOptions?.platformContext ?: context)
+    private val initialWindowId = initOptions?.windowId?.takeIf { it > 0L }
 
     private fun hasOpenedMedia(): Boolean = openResource.value != null
 
@@ -115,6 +123,12 @@ actual class MpvMediampPlayer (
         handle.setEventListener(eventListener)
 
         handle.option("config", "no")
+        initOptions?.logFilePath
+            ?.takeIf { it.isNotBlank() }
+            ?.let { logFilePath ->
+                handle.option("log-file", logFilePath)
+                handle.option("msg-level", "all=v")
+            }
         // handle.option("config-dir", File(filesDir, "mpv_config").absolutePath)
         // handle.option("gpu-shader-cache-dir", File(cacheDir, "mpv_gpu_cache").absolutePath)
         // handle.option("icc-cache-dir", File(cacheDir, "mpv_icc_cache").absolutePath)
@@ -132,6 +146,7 @@ actual class MpvMediampPlayer (
                 handle.option("gpu-api", "opengl")
                 handle.option("opengl-es", "no")
                 handle.option("ao", "wasapi")
+                initialWindowId?.let { handle.option("wid", it.toString()) }
             }
             is Platform.MacOS -> {
                 handle.option("gpu-context", "macvk")
@@ -195,10 +210,18 @@ actual class MpvMediampPlayer (
             // 清除播放列表
             handle.command("stop")
             handle.command("playlist-clear")
-            // 设置 headers 和 ua
-            handle.option("user-agent", headers["User-Agent"] ?: """Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3""")
+            handle.setPropertyString("vid", "auto")
+            handle.setPropertyString("aid", "auto")
+            // 设置 headers 和 ua. User-Agent must be set through mpv's dedicated option;
+            // putting it in http-header-fields as well can make some providers return 400.
+            val userAgent = headers.entries
+                .firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
+                ?.value
+                ?: """Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"""
+            handle.option("user-agent", userAgent)
             handle.option("http-header-fields-clr", "")
             headers.forEach { (key, value) ->
+                if (key.equals("User-Agent", ignoreCase = true)) return@forEach
                 handle.option("http-header-fields", "$key: $value")
             }
 
