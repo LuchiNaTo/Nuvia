@@ -22,7 +22,8 @@ internal actual object ThemeSettingsStorage {
     private const val preferencesName = "nuvio_theme_settings"
     private const val selectedThemeKey = "selected_theme"
     private const val amoledEnabledKey = "amoled_enabled"
-    private val syncKeys = listOf(selectedThemeKey, amoledEnabledKey)
+    private const val selectedAppLanguageKey = "selected_app_language"
+    private val syncKeys = listOf(selectedThemeKey, amoledEnabledKey, selectedAppLanguageKey)
 
     actual fun loadSelectedTheme(): String? =
         DesktopPreferences.getString(preferencesName, ProfileScopedKey.of(selectedThemeKey))
@@ -38,9 +39,19 @@ internal actual object ThemeSettingsStorage {
         DesktopPreferences.putBoolean(preferencesName, ProfileScopedKey.of(amoledEnabledKey), enabled)
     }
 
+    actual fun loadSelectedAppLanguage(): String? =
+        DesktopPreferences.getString(preferencesName, ProfileScopedKey.of(selectedAppLanguageKey))
+
+    actual fun saveSelectedAppLanguage(languageCode: String) {
+        DesktopPreferences.putString(preferencesName, ProfileScopedKey.of(selectedAppLanguageKey), languageCode)
+    }
+
+    actual fun applySelectedAppLanguage(languageCode: String) = Unit
+
     actual fun exportToSyncPayload(): JsonObject = buildJsonObject {
         loadSelectedTheme()?.let { put(selectedThemeKey, encodeSyncString(it)) }
         loadAmoledEnabled()?.let { put(amoledEnabledKey, encodeSyncBoolean(it)) }
+        loadSelectedAppLanguage()?.let { put(selectedAppLanguageKey, encodeSyncString(it)) }
     }
 
     actual fun replaceFromSyncPayload(payload: JsonObject) {
@@ -48,6 +59,7 @@ internal actual object ThemeSettingsStorage {
 
         payload.decodeSyncString(selectedThemeKey)?.let(::saveSelectedTheme)
         payload.decodeSyncBoolean(amoledEnabledKey)?.let(::saveAmoledEnabled)
+        payload.decodeSyncString(selectedAppLanguageKey)?.let(::saveSelectedAppLanguage)
     }
 }
 

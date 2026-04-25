@@ -383,6 +383,20 @@ val generatedRuntimeConfigDir = layout.buildDirectory.dir("generated/runtime-con
 val windowsRuntimeInputDir = resolveWindowsRuntimeInputDir(project)
 val preparedWindowsRuntimeDir = layout.buildDirectory.dir("vendor-runtime/windows-x64")
 val generatedMediampWindowsRuntimeDir = rootProject.layout.projectDirectory.dir("mediamp/mediamp-mpv/build/libs")
+val desktopPlayerBackendForBuild = (
+    providers.gradleProperty("nuvio.desktopPlayerBackend").orNull
+        ?: System.getenv("NUVIO_DESKTOP_PLAYER_BACKEND")
+        ?: if (
+            (providers.gradleProperty("nuvio.enableNativeBridge").orNull
+                ?: System.getenv("NUVIO_ENABLE_NATIVE_BRIDGE"))
+                ?.toBooleanStrictOrNull() == true
+        ) {
+            "native"
+        } else {
+            "vlc"
+        }
+    ).trim().lowercase()
+val bundleWindowsMpvRuntime = desktopPlayerBackendForBuild == "mpv"
 val desktopProguardEnabled = providers.gradleProperty("nuvio.desktop.proguard")
     .map { it.equals("true", ignoreCase = true) }
     .orElse(false)
@@ -422,8 +436,10 @@ val syncVendoredWindowsRuntime = tasks.register<SyncVendoredWindowsRuntimeTask>(
     outputDir.set(layout.projectDirectory.dir("vendor-runtime/windows-x64"))
 }
 
-prepareWindowsRuntime.configure {
-    dependsOn(syncVendoredWindowsRuntime)
+if (bundleWindowsMpvRuntime) {
+    prepareWindowsRuntime.configure {
+        dependsOn(syncVendoredWindowsRuntime)
+    }
 }
 
 tasks.withType<KotlinCompilationTask<*>>().configureEach {
@@ -438,19 +454,21 @@ tasks.withType<JavaExec>().matching { it.name == "run" }.configureEach {
     executable = java21Launcher.get().executablePath.asFile.absolutePath
 }
 
-tasks.matching {
-    it.name in setOf(
-        "run",
-        "createDistributable",
-        "createReleaseDistributable",
-        "packageDistributionForCurrentOS",
-        "packageReleaseDistributionForCurrentOS",
-        "packageExe",
-        "packageReleaseExe",
-        "proguardReleaseJars",
-    )
-}.configureEach {
-    dependsOn(prepareWindowsRuntime)
+if (bundleWindowsMpvRuntime) {
+    tasks.matching {
+        it.name in setOf(
+            "run",
+            "createDistributable",
+            "createReleaseDistributable",
+            "packageDistributionForCurrentOS",
+            "packageReleaseDistributionForCurrentOS",
+            "packageExe",
+            "packageReleaseExe",
+            "proguardReleaseJars",
+        )
+    }.configureEach {
+        dependsOn(prepareWindowsRuntime)
+    }
 }
 
 kotlin {
@@ -512,17 +530,20 @@ kotlin {
                 implementation(libs.ktor.client.java)
                 implementation(libs.kotlinx.coroutines.swing)
                 implementation(libs.jna)
-                // mediamp-mpv for Windows desktop player
+                // Vendored MediaMP source of truth for Windows desktop backends.
                 implementation("org.openani.mediamp:mediamp-api:0.1.0-dev-1")
+                implementation("org.openani.mediamp:mediamp-vlc:0.1.0-dev-1")
                 implementation("org.openani.mediamp:mediamp-mpv:0.1.0-dev-1")
-                implementation(
-                    fileTree(
-                        mapOf(
-                            "dir" to preparedWindowsRuntimeDir.get().asFile,
-                            "include" to listOf("*.jar"),
+                if (bundleWindowsMpvRuntime) {
+                    implementation(
+                        fileTree(
+                            mapOf(
+                                "dir" to preparedWindowsRuntimeDir.get().asFile,
+                                "include" to listOf("*.jar"),
+                            ),
                         ),
-                    ),
-                )
+                    )
+                }
             }
         }
         androidMain.dependencies {

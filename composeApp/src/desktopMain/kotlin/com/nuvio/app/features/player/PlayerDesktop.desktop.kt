@@ -50,16 +50,29 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import org.openani.mediamp.features.AspectRatioMode
+import org.openani.mediamp.features.AudioLevelController
+import org.openani.mediamp.features.MediaMetadata
+import org.openani.mediamp.features.PlaybackSpeed
+import org.openani.mediamp.features.VideoAspectRatio
 import org.openani.mediamp.InternalMediampApi
 import org.openani.mediamp.PlaybackState
 import org.openani.mediamp.mpv.MPVHandle
 import org.openani.mediamp.mpv.MpvMediampPlayerInitOptions
 import org.openani.mediamp.mpv.MpvMediampPlayer
+import org.openani.mediamp.metadata.AudioTrack as MediampAudioTrack
+import org.openani.mediamp.metadata.SubtitleTrack as MediampSubtitleTrack
+import org.openani.mediamp.source.MediaExtraFiles
+import org.openani.mediamp.source.Subtitle as MediampSubtitleFile
 import org.openani.mediamp.source.UriMediaData
+import org.openani.mediamp.vlc.VlcMediampPlayer
+import org.openani.mediamp.vlc.compose.VlcMediampPlayerSurface
 
 private val isMacOS: Boolean by lazy {
     System.getProperty("os.name")?.lowercase()?.contains("mac") == true
@@ -71,6 +84,45 @@ private val hasWindowsNativeBridge: Boolean
 private const val DESKTOP_PLAYBACK_USER_AGENT =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+private const val VLC_RUNTIME_NOT_FOUND_MESSAGE =
+    "VLC runtime not found / install VLC 64-bit or configure bundled VLC runtime."
+
+private enum class WindowsDesktopBackend(val logName: String) {
+    VLC("windows-mediamp-vlc"),
+    MPV("windows-mediamp-mpv"),
+    NATIVE("windows-native-bridge"),
+}
+
+private data class ResolvedWindowsDesktopBackend(
+    val backend: WindowsDesktopBackend,
+    val source: String,
+)
+
+private fun resolveWindowsDesktopBackend(): ResolvedWindowsDesktopBackend {
+    val explicitBackend = (System.getProperty("nuvio.desktopPlayerBackend")
+        ?: System.getenv("NUVIO_DESKTOP_PLAYER_BACKEND"))
+        ?.trim()
+        ?.lowercase(Locale.ROOT)
+        ?.takeIf(String::isNotEmpty)
+
+    return when (explicitBackend) {
+        "vlc" -> ResolvedWindowsDesktopBackend(WindowsDesktopBackend.VLC, "desktopPlayerBackend")
+        "mpv" -> ResolvedWindowsDesktopBackend(WindowsDesktopBackend.MPV, "desktopPlayerBackend")
+        "native" -> ResolvedWindowsDesktopBackend(WindowsDesktopBackend.NATIVE, "desktopPlayerBackend")
+        else -> {
+            val nativeBridgeCompatibilityEnabled =
+                (System.getProperty("nuvio.enableNativeBridge")
+                    ?: System.getenv("NUVIO_ENABLE_NATIVE_BRIDGE"))
+                    ?.toBooleanStrictOrNull() == true
+            if (nativeBridgeCompatibilityEnabled) {
+                ResolvedWindowsDesktopBackend(WindowsDesktopBackend.NATIVE, "nativeBridgeAlias")
+            } else {
+                ResolvedWindowsDesktopBackend(WindowsDesktopBackend.VLC, "default")
+            }
+        }
+    }
+}
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -87,15 +139,27 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
-    LaunchedEffect(isMacOS, hasWindowsNativeBridge) {
-        val selectedBackend = when {
-            isMacOS -> "macos-native-bridge"
-            hasWindowsNativeBridge -> "windows-native-bridge"
-            else -> "windows-mediamp-mpv"
+    val resolvedWindowsBackend = remember {
+        if (isMacOS) null else resolveWindowsDesktopBackend()
+    }
+
+    LaunchedEffect(isMacOS, resolvedWindowsBackend?.backend, resolvedWindowsBackend?.source) {
+        val selectedBackend = if (isMacOS) {
+            "macos-native-bridge"
+        } else {
+            resolvedWindowsBackend?.backend?.logName ?: WindowsDesktopBackend.VLC.logName
         }
         DesktopRuntimeDiagnostics.info(
             tag = "PlayerDesktop",
-            message = "Selected player backend=$selectedBackend",
+            message = buildString {
+                append("Selected player backend=")
+                append(selectedBackend)
+                if (!isMacOS && resolvedWindowsBackend != null) {
+                    append(" (source=")
+                    append(resolvedWindowsBackend.source)
+                    append(')')
+                }
+            },
         )
     }
 
@@ -115,33 +179,59 @@ actual fun PlatformPlayerSurface(
             onError = onError,
         )
     } else {
-        if (hasWindowsNativeBridge) {
-            WindowsNativePlayerSurface(
-                sourceUrl = sourceUrl,
-                sourceAudioUrl = sourceAudioUrl,
-                sourceHeaders = sourceHeaders,
-                sourceResponseHeaders = sourceResponseHeaders,
-                useYoutubeChunkedPlayback = useYoutubeChunkedPlayback,
-                modifier = modifier,
-                playWhenReady = playWhenReady,
-                resizeMode = resizeMode,
-                useNativeController = useNativeController,
-                onControllerReady = onControllerReady,
-                onSnapshot = onSnapshot,
-                onError = onError,
-            )
-        } else {
-            WindowsMpvPlayerSurface(
-                sourceUrl = sourceUrl,
-                sourceAudioUrl = sourceAudioUrl,
-                sourceHeaders = sourceHeaders,
-                modifier = modifier,
-                playWhenReady = playWhenReady,
-                resizeMode = resizeMode,
-                onControllerReady = onControllerReady,
-                onSnapshot = onSnapshot,
-                onError = onError,
-            )
+        when (resolvedWindowsBackend?.backend ?: WindowsDesktopBackend.VLC) {
+            WindowsDesktopBackend.VLC -> {
+                WindowsVlcPlayerSurface(
+                    sourceUrl = sourceUrl,
+                    sourceAudioUrl = sourceAudioUrl,
+                    sourceHeaders = sourceHeaders,
+                    modifier = modifier,
+                    playWhenReady = playWhenReady,
+                    resizeMode = resizeMode,
+                    onControllerReady = onControllerReady,
+                    onSnapshot = onSnapshot,
+                    onError = onError,
+                )
+            }
+
+            WindowsDesktopBackend.MPV -> {
+                WindowsMpvPlayerSurface(
+                    sourceUrl = sourceUrl,
+                    sourceAudioUrl = sourceAudioUrl,
+                    sourceHeaders = sourceHeaders,
+                    modifier = modifier,
+                    playWhenReady = playWhenReady,
+                    resizeMode = resizeMode,
+                    onControllerReady = onControllerReady,
+                    onSnapshot = onSnapshot,
+                    onError = onError,
+                )
+            }
+
+            WindowsDesktopBackend.NATIVE -> if (hasWindowsNativeBridge) {
+                WindowsNativePlayerSurface(
+                    sourceUrl = sourceUrl,
+                    sourceAudioUrl = sourceAudioUrl,
+                    sourceHeaders = sourceHeaders,
+                    sourceResponseHeaders = sourceResponseHeaders,
+                    useYoutubeChunkedPlayback = useYoutubeChunkedPlayback,
+                    modifier = modifier,
+                    playWhenReady = playWhenReady,
+                    resizeMode = resizeMode,
+                    useNativeController = useNativeController,
+                    onControllerReady = onControllerReady,
+                    onSnapshot = onSnapshot,
+                    onError = onError,
+                )
+            } else {
+                DesktopControlledErrorSurface(
+                    modifier = modifier,
+                    errorMessage = "Windows native bridge requested but unavailable.",
+                    onControllerReady = onControllerReady,
+                    onSnapshot = onSnapshot,
+                    onError = onError,
+                )
+            }
         }
     }
 }
@@ -188,13 +278,9 @@ private fun WindowsNativePlayerSurface(
 ) {
     val bridge = remember { WindowsDesktopMPVBridgeLib.loadOrNull() }
     if (bridge == null) {
-        WindowsMpvPlayerSurface(
-            sourceUrl = sourceUrl,
-            sourceAudioUrl = sourceAudioUrl,
-            sourceHeaders = sourceHeaders,
+        DesktopControlledErrorSurface(
             modifier = modifier,
-            playWhenReady = playWhenReady,
-            resizeMode = resizeMode,
+            errorMessage = "Windows native bridge requested but unavailable.",
             onControllerReady = onControllerReady,
             onSnapshot = onSnapshot,
             onError = onError,
@@ -541,6 +627,35 @@ private object DesktopPlayerGestureController : PlayerGestureController {
         DesktopPlayerGestureBridge.setVolume(level)
 }
 
+@Composable
+private fun DesktopControlledErrorSurface(
+    modifier: Modifier,
+    errorMessage: String,
+    onControllerReady: (PlayerEngineController) -> Unit,
+    onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
+    onError: (String?) -> Unit,
+) {
+    val currentOnControllerReady by rememberUpdatedState(onControllerReady)
+    val currentOnSnapshot by rememberUpdatedState(onSnapshot)
+    val currentOnError by rememberUpdatedState(onError)
+
+    LaunchedEffect(errorMessage) {
+        DesktopRuntimeDiagnostics.warn(
+            tag = "PlayerDesktop",
+            message = "Player fallback/error UI path triggered: $errorMessage",
+        )
+        currentOnControllerReady(NoOpPlayerEngineController)
+        currentOnSnapshot(PlayerPlaybackSnapshot())
+        currentOnError(errorMessage)
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color.Black),
+    )
+}
+
 private object NoOpPlayerEngineController : PlayerEngineController {
     override fun play() = Unit
     override fun pause() = Unit
@@ -556,6 +671,286 @@ private object NoOpPlayerEngineController : PlayerEngineController {
     override fun clearExternalSubtitle() = Unit
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) = Unit
     override fun switchSource(url: String, audioUrl: String?, headersJson: String?) = Unit
+}
+
+private data class WindowsVlcMediaRequest(
+    val url: String,
+    val audioUrl: String?,
+    val headers: Map<String, String>,
+    val externalSubtitles: List<MediampSubtitleFile> = emptyList(),
+    val reloadNonce: Int = 0,
+)
+
+private fun createWindowsVlcMediaRequest(
+    url: String,
+    audioUrl: String?,
+    headers: Map<String, String>,
+    externalSubtitles: List<MediampSubtitleFile> = emptyList(),
+    reloadNonce: Int = 0,
+): WindowsVlcMediaRequest = WindowsVlcMediaRequest(
+    url = url,
+    audioUrl = audioUrl,
+    headers = headers.toMap(),
+    externalSubtitles = externalSubtitles,
+    reloadNonce = reloadNonce,
+)
+
+@Composable
+private fun WindowsVlcPlayerSurface(
+    sourceUrl: String,
+    sourceAudioUrl: String?,
+    sourceHeaders: Map<String, String>,
+    modifier: Modifier,
+    playWhenReady: Boolean,
+    resizeMode: PlayerResizeMode,
+    onControllerReady: (PlayerEngineController) -> Unit,
+    onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
+    onError: (String?) -> Unit,
+) {
+    val currentOnControllerReady by rememberUpdatedState(onControllerReady)
+    val currentOnSnapshot by rememberUpdatedState(onSnapshot)
+    val currentOnError by rememberUpdatedState(onError)
+
+    var fatalErrorMessage by remember { mutableStateOf<String?>(null) }
+    var playerResult by remember { mutableStateOf<Result<VlcMediampPlayer>?>(null) }
+    var pendingSelectedSubtitleId by remember { mutableStateOf<String?>(null) }
+    var mediaRequest by remember(sourceUrl, sourceAudioUrl, sourceHeaders) {
+        mutableStateOf(
+            createWindowsVlcMediaRequest(
+                url = sourceUrl,
+                audioUrl = sourceAudioUrl,
+                headers = sourceHeaders,
+            ),
+        )
+    }
+
+    fun reportFatalFailure(
+        phase: String,
+        throwable: Throwable,
+        userFacingMessage: String = throwable.message?.takeIf(String::isNotBlank)
+            ?: "Windows mediamp/vlc failed during $phase",
+    ) {
+        if (fatalErrorMessage == userFacingMessage) return
+
+        DesktopRuntimeDiagnostics.error(
+            tag = "PlayerDesktop",
+            message = "Windows mediamp/vlc failure during $phase; switching to controlled error UI.",
+            throwable = throwable,
+        )
+        fatalErrorMessage = userFacingMessage
+        currentOnError(userFacingMessage)
+    }
+
+    val initializationFailure = playerResult?.exceptionOrNull()
+    LaunchedEffect(initializationFailure) {
+        initializationFailure?.let {
+            reportFatalFailure("initialization", it, VLC_RUNTIME_NOT_FOUND_MESSAGE)
+        }
+    }
+
+    LaunchedEffect(fatalErrorMessage) {
+        if (fatalErrorMessage != null) {
+            currentOnControllerReady(NoOpPlayerEngineController)
+            currentOnSnapshot(PlayerPlaybackSnapshot())
+        }
+    }
+
+    LaunchedEffect(fatalErrorMessage) {
+        if (fatalErrorMessage != null || playerResult != null) return@LaunchedEffect
+
+        val discoverySource = System.getProperty("compose.application.resources.dir")
+            ?.takeIf(String::isNotBlank)
+            ?.let { "compose.application.resources.dir=$it" }
+            ?: "system-installed runtime discovery"
+
+        playerResult = runCatching {
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "Preparing VLC runtime using $discoverySource",
+            )
+            VlcMediampPlayer.prepareLibraries()
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "VLC runtime discovery succeeded.",
+            )
+            VlcMediampPlayer(kotlin.coroutines.EmptyCoroutineContext)
+        }
+    }
+
+    val player = playerResult?.getOrNull()
+    if (fatalErrorMessage != null) {
+        DesktopControlledErrorSurface(
+            modifier = modifier,
+            errorMessage = fatalErrorMessage ?: "Playback error",
+            onControllerReady = onControllerReady,
+            onSnapshot = onSnapshot,
+            onError = onError,
+        )
+        return
+    }
+
+    if (player == null) {
+        Box(
+            modifier = modifier
+                .fillMaxSize()
+                .background(Color.Black),
+        )
+        return
+    }
+
+    DisposableEffect(player) {
+        val audioLevelController = player.features[AudioLevelController.Key]
+        DesktopPlayerGestureBridge.register(
+            token = player,
+            currentVolumeProvider = {
+                audioLevelController?.let {
+                    PlayerAudioLevel(
+                        fraction = it.volume.value.coerceIn(0f, 1f),
+                        isMuted = it.isMute.value || it.volume.value <= 0f,
+                    )
+                }
+            },
+            setVolumeProvider = { level ->
+                audioLevelController?.let {
+                    it.setVolume(level.coerceIn(0f, 1f))
+                    PlayerAudioLevel(
+                        fraction = it.volume.value.coerceIn(0f, 1f),
+                        isMuted = it.isMute.value || it.volume.value <= 0f,
+                    )
+                }
+            },
+        )
+        onDispose {
+            DesktopPlayerGestureBridge.unregister(player)
+            runCatching { player.close() }
+                .onFailure { error ->
+                    DesktopRuntimeDiagnostics.warn(
+                        tag = "PlayerDesktop",
+                        message = "Failed to close VLC player cleanly.",
+                        throwable = error,
+                    )
+                }
+        }
+    }
+
+    LaunchedEffect(player, mediaRequest) {
+        try {
+            currentOnError(null)
+
+            val normalizedHeaders = mediaRequest.headers.toMutableMap()
+            if (normalizedHeaders.keys.none { it.equals("User-Agent", ignoreCase = true) }) {
+                normalizedHeaders["User-Agent"] = DESKTOP_PLAYBACK_USER_AGENT
+            }
+
+            if (!mediaRequest.audioUrl.isNullOrBlank()) {
+                DesktopRuntimeDiagnostics.warn(
+                    tag = "PlayerDesktop",
+                    message = "VLC backend received a separate audio URL; external audio is not wired in this first pass.",
+                )
+            }
+
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "Initializing mediamp/vlc playback path.",
+            )
+            player.setMediaData(
+                UriMediaData(
+                    uri = mediaRequest.url,
+                    headers = normalizedHeaders,
+                    extraFiles = MediaExtraFiles(mediaRequest.externalSubtitles),
+                ),
+            )
+            if (playWhenReady) {
+                player.resume()
+            }
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            reportFatalFailure("media load", e)
+        }
+    }
+
+    LaunchedEffect(player, playWhenReady) {
+        runCatching {
+            val state = player.getCurrentPlaybackState()
+            if (playWhenReady && (state == PlaybackState.READY || state == PlaybackState.PAUSED || state == PlaybackState.PAUSED_BUFFERING)) {
+                player.resume()
+            } else if (!playWhenReady && state == PlaybackState.PLAYING) {
+                player.pause()
+            }
+        }.onFailure {
+            reportFatalFailure("playback toggle", it)
+        }
+    }
+
+    LaunchedEffect(player, resizeMode) {
+        val aspectRatio = player.features[VideoAspectRatio.Key] ?: return@LaunchedEffect
+        val mode = when (resizeMode) {
+            PlayerResizeMode.Fit -> AspectRatioMode.FIT
+            PlayerResizeMode.Fill, PlayerResizeMode.Zoom -> AspectRatioMode.CROP
+        }
+        aspectRatio.setMode(mode)
+    }
+
+    LaunchedEffect(player, pendingSelectedSubtitleId) {
+        val subtitleId = pendingSelectedSubtitleId ?: return@LaunchedEffect
+        val subtitleGroup = player.features[MediaMetadata]?.subtitleTracks ?: return@LaunchedEffect
+        val candidates = subtitleGroup.candidates as? StateFlow<List<MediampSubtitleTrack>> ?: return@LaunchedEffect
+        candidates.collectLatest { tracks ->
+            val selectedTrack = tracks.firstOrNull { it.id == subtitleId } ?: return@collectLatest
+            if (subtitleGroup.select(selectedTrack)) {
+                pendingSelectedSubtitleId = null
+            }
+        }
+    }
+
+    val controller = remember(player) {
+        WindowsVlcController(
+            player = player,
+            currentRequest = { mediaRequest },
+            updateRequest = { mediaRequest = it },
+            setPendingSubtitleSelection = { pendingSelectedSubtitleId = it },
+        )
+    }
+
+    LaunchedEffect(controller) {
+        currentOnControllerReady(controller)
+    }
+
+    LaunchedEffect(player) {
+        combine(
+            player.playbackState,
+            player.currentPositionMillis,
+            player.mediaProperties,
+            player.features[PlaybackSpeed.Key]?.valueFlow ?: flowOf(1f),
+        ) { state, position, props, playbackSpeed ->
+            PlayerPlaybackSnapshot(
+                isLoading = state == PlaybackState.READY || state == PlaybackState.PAUSED_BUFFERING,
+                isPlaying = state == PlaybackState.PLAYING,
+                isEnded = state == PlaybackState.FINISHED,
+                positionMs = position,
+                durationMs = props?.durationMillis?.takeIf { it > 0 } ?: 0L,
+                bufferedPositionMs = 0L,
+                playbackSpeed = playbackSpeed,
+            )
+        }.collectLatest { snapshot ->
+            currentOnSnapshot(snapshot)
+        }
+    }
+
+    LaunchedEffect(player) {
+        player.playbackState.collectLatest { state ->
+            if (state == PlaybackState.ERROR) {
+                currentOnError("Playback error")
+            } else if (fatalErrorMessage == null) {
+                currentOnError(null)
+            }
+        }
+    }
+
+    VlcMediampPlayerSurface(
+        mediampPlayer = player,
+        modifier = modifier.background(Color.Black),
+    )
 }
 
 @OptIn(InternalMediampApi::class)
@@ -1130,6 +1525,164 @@ private class WindowsMpvController(
             handle.setPropertyBoolean("pause", false)
         }
     }
+}
+
+private class WindowsVlcController(
+    private val player: VlcMediampPlayer,
+    private val currentRequest: () -> WindowsVlcMediaRequest,
+    private val updateRequest: (WindowsVlcMediaRequest) -> Unit,
+    private val setPendingSubtitleSelection: (String?) -> Unit,
+) : PlayerEngineController {
+
+    override fun play() {
+        runCatching { player.resume() }
+    }
+
+    override fun pause() {
+        runCatching { player.pause() }
+    }
+
+    override fun seekTo(positionMs: Long) {
+        runCatching { player.seekTo(positionMs) }
+    }
+
+    override fun seekBy(offsetMs: Long) {
+        runCatching { player.skip(offsetMs) }
+    }
+
+    override fun retry() {
+        val request = currentRequest()
+        updateRequest(request.copy(reloadNonce = request.reloadNonce + 1))
+    }
+
+    override fun setPlaybackSpeed(speed: Float) {
+        runCatching {
+            player.features[PlaybackSpeed.Key]
+                ?.set(speed.coerceIn(0.25f, 4f))
+        }
+    }
+
+    override fun getAudioTracks(): List<AudioTrack> =
+        readAudioTracks()
+
+    override fun getSubtitleTracks(): List<SubtitleTrack> =
+        readSubtitleTracks()
+
+    override fun selectAudioTrack(index: Int) {
+        runCatching {
+            val audioTracks = player.features[MediaMetadata]?.audioTracks ?: return@runCatching
+            val candidates = audioTracks.candidates as? StateFlow<List<MediampAudioTrack>> ?: return@runCatching
+            audioTracks.select(candidates.value.getOrNull(index))
+        }
+    }
+
+    override fun selectSubtitleTrack(index: Int) {
+        runCatching {
+            val subtitleTracks = player.features[MediaMetadata]?.subtitleTracks ?: return@runCatching
+            if (index < 0) {
+                subtitleTracks.select(null)
+                return@runCatching
+            }
+            val candidates = subtitleTracks.candidates as? StateFlow<List<MediampSubtitleTrack>> ?: return@runCatching
+            subtitleTracks.select(candidates.value.getOrNull(index))
+        }
+    }
+
+    override fun setSubtitleUri(url: String) {
+        val request = currentRequest()
+        updateRequest(
+            request.copy(
+                externalSubtitles = listOf(MediampSubtitleFile(uri = url)),
+                reloadNonce = request.reloadNonce + 1,
+            ),
+        )
+        setPendingSubtitleSelection(null)
+    }
+
+    override fun clearExternalSubtitle() {
+        val request = currentRequest()
+        updateRequest(
+            request.copy(
+                externalSubtitles = emptyList(),
+                reloadNonce = request.reloadNonce + 1,
+            ),
+        )
+        setPendingSubtitleSelection(null)
+    }
+
+    override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
+        val selectedSubtitleId = getSubtitleTracks().getOrNull(trackIndex)?.id
+        val request = currentRequest()
+        updateRequest(
+            request.copy(
+                externalSubtitles = emptyList(),
+                reloadNonce = request.reloadNonce + 1,
+            ),
+        )
+        setPendingSubtitleSelection(selectedSubtitleId)
+    }
+
+    override fun applySubtitleStyle(style: SubtitleStyleState) = Unit
+
+    override fun switchSource(url: String, audioUrl: String?, headersJson: String?) {
+        val current = currentRequest()
+        updateRequest(
+            createWindowsVlcMediaRequest(
+                url = url,
+                audioUrl = audioUrl,
+                headers = parsePlaybackHeadersJson(headersJson),
+                reloadNonce = current.reloadNonce + 1,
+            ),
+        )
+        setPendingSubtitleSelection(null)
+    }
+
+    private fun readAudioTracks(): List<AudioTrack> {
+        val audioTracks = player.features[MediaMetadata]?.audioTracks ?: return emptyList()
+        val candidates = audioTracks.candidates as? StateFlow<List<MediampAudioTrack>> ?: return emptyList()
+        val selected = audioTracks.selected.value
+        return candidates.value.mapIndexed { index, track ->
+            AudioTrack(
+                index = index,
+                id = track.id,
+                label = track.name
+                    ?: track.labels.firstOrNull()?.value
+                    ?: "Track ${index + 1}",
+                language = track.labels.firstOrNull()?.language,
+                isSelected = selected?.id == track.id,
+            )
+        }
+    }
+
+    private fun readSubtitleTracks(): List<SubtitleTrack> {
+        val subtitleTracks = player.features[MediaMetadata]?.subtitleTracks ?: return emptyList()
+        val candidates = subtitleTracks.candidates as? StateFlow<List<MediampSubtitleTrack>> ?: return emptyList()
+        val selected = subtitleTracks.selected.value
+        return candidates.value.mapIndexed { index, track ->
+            SubtitleTrack(
+                index = index,
+                id = track.id,
+                label = track.labels.firstOrNull()?.value ?: "Subtitle ${index + 1}",
+                language = track.language ?: track.labels.firstOrNull()?.language,
+                isSelected = selected?.id == track.id,
+                isForced = false,
+            )
+        }
+    }
+}
+
+private fun parsePlaybackHeadersJson(headersJson: String?): Map<String, String> {
+    if (headersJson.isNullOrBlank()) return emptyMap()
+
+    val headers = LinkedHashMap<String, String>()
+    val headerPattern = Regex(""""([^"]+)"\s*:\s*"([^"]*)"""")
+    headerPattern.findAll(headersJson).forEach { match ->
+        val (key, value) = match.destructured
+        if (key.isNotBlank() && value.isNotBlank()) {
+            headers[key] = value
+        }
+    }
+    return headers
 }
 
 private fun MPVHandle.setProperty(name: String, value: Boolean): Boolean =

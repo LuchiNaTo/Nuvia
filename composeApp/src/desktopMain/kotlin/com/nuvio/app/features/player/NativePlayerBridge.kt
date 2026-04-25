@@ -10,10 +10,19 @@ private val isWindowsDesktop: Boolean by lazy {
     System.getProperty("os.name")?.lowercase()?.contains("windows") == true
 }
 
+private val requestedDesktopBackend: String? by lazy {
+    (System.getProperty("nuvio.desktopPlayerBackend")
+        ?: System.getenv("NUVIO_DESKTOP_PLAYER_BACKEND"))
+        ?.trim()
+        ?.lowercase()
+        ?.takeIf(String::isNotEmpty)
+}
+
 private val nativeBridgeEnabled: Boolean by lazy {
-    (System.getProperty("nuvio.enableNativeBridge")
-        ?: System.getenv("NUVIO_ENABLE_NATIVE_BRIDGE"))
-        ?.toBooleanStrictOrNull() == true
+    requestedDesktopBackend == "native" ||
+        (System.getProperty("nuvio.enableNativeBridge")
+            ?: System.getenv("NUVIO_ENABLE_NATIVE_BRIDGE"))
+            ?.toBooleanStrictOrNull() == true
 }
 
 internal interface DesktopMPVBridgeLib : Library {
@@ -179,7 +188,7 @@ internal interface WindowsDesktopMPVBridgeLib : Library {
             if (!nativeBridgeEnabled) {
                 DesktopRuntimeDiagnostics.info(
                     tag = "NativePlayerBridge",
-                    message = "Experimental Windows native bridge disabled; mediamp/mpv remains the primary backend.",
+                    message = "Experimental Windows native bridge disabled; VLC remains the default desktop backend.",
                 )
                 return@lazy null
             }
@@ -211,7 +220,7 @@ internal interface WindowsDesktopMPVBridgeLib : Library {
             }.onFailure { error ->
                 DesktopRuntimeDiagnostics.warn(
                     tag = "NativePlayerBridge",
-                    message = "Windows native bridge is unavailable; falling back to mediamp/mpv.",
+                    message = "Windows native bridge is unavailable.",
                     throwable = error,
                 )
             }.getOrNull()

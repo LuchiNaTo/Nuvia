@@ -6,9 +6,7 @@
  * https://github.com/open-ani/mediamp/blob/main/LICENSE
  */
 
-import com.vanniktech.maven.publish.JavadocJar
-import com.vanniktech.maven.publish.KotlinJvm
-import com.vanniktech.maven.publish.SourcesJar
+import localcomposite.isLocalCompositeMediamp
 
 plugins {
     kotlin("jvm")
@@ -16,10 +14,12 @@ plugins {
     id("org.jetbrains.compose")
 
     `mpp-lib-targets`
-    id(libs.plugins.vanniktech.mavenPublish.get().pluginId)
 }
 
 description = "MediaMP backend using VLC"
+val isLocalComposite = isLocalCompositeMediamp()
+// Nuvio uses vendored MediaMP via local composite build. Publishing is intentionally
+// bypassed here to avoid pulling the Vanniktech publishing toolchain into composite mode.
 
 dependencies {
     api(projects.mediampApi)
@@ -33,9 +33,3 @@ kotlin {
     explicitApi()
 }
 
-mavenPublishing {
-    configure(KotlinJvm(JavadocJar.Empty(), SourcesJar.Sources()))
-    publishToMavenCentral()
-    signAllPublicationsIfEnabled(project)
-    configurePom(project)
-}

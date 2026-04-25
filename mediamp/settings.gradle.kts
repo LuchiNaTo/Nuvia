@@ -30,9 +30,9 @@ include(":mediamp-internal-utils")
 include(":mediamp-api")
 include(":mediamp-mpv")
 include(":mediamp-ffmpeg")
+include(":mediamp-vlc")
 
 if (!isLocalComposite) {
-    include(":mediamp-vlc")
     include(":mediamp-vlc-loader")
     include(":mediamp-exoplayer")
     include(":mediamp-avkit")
