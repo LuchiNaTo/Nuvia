@@ -11,6 +11,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.awt.SwingPanel
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
@@ -695,6 +696,7 @@ private fun createWindowsVlcMediaRequest(
     reloadNonce = reloadNonce,
 )
 
+@OptIn(InternalMediampApi::class)
 @Composable
 private fun WindowsVlcPlayerSurface(
     sourceUrl: String,
@@ -710,6 +712,7 @@ private fun WindowsVlcPlayerSurface(
     val currentOnControllerReady by rememberUpdatedState(onControllerReady)
     val currentOnSnapshot by rememberUpdatedState(onSnapshot)
     val currentOnError by rememberUpdatedState(onError)
+    var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
 
     var fatalErrorMessage by remember { mutableStateOf<String?>(null) }
     var playerResult by remember { mutableStateOf<Result<VlcMediampPlayer>?>(null) }
@@ -778,6 +781,7 @@ private fun WindowsVlcPlayerSurface(
     }
 
     val player = playerResult?.getOrNull()
+    val playerInstanceId = player?.let { Integer.toHexString(System.identityHashCode(it)) }
     if (fatalErrorMessage != null) {
         DesktopControlledErrorSurface(
             modifier = modifier,
@@ -799,6 +803,10 @@ private fun WindowsVlcPlayerSurface(
     }
 
     DisposableEffect(player) {
+        DesktopRuntimeDiagnostics.info(
+            tag = "PlayerDesktop",
+            message = "VLC player instance created id=${Integer.toHexString(System.identityHashCode(player))}",
+        )
         val audioLevelController = player.features[AudioLevelController.Key]
         DesktopPlayerGestureBridge.register(
             token = player,
@@ -851,7 +859,7 @@ private fun WindowsVlcPlayerSurface(
 
             DesktopRuntimeDiagnostics.info(
                 tag = "PlayerDesktop",
-                message = "Initializing mediamp/vlc playback path.",
+                message = "Initializing mediamp/vlc playback path. playerId=$playerInstanceId, urlHost=${runCatching { URI(mediaRequest.url).host }.getOrNull() ?: "<unknown>"}, subtitles=${mediaRequest.externalSubtitles.size}",
             )
             player.setMediaData(
                 UriMediaData(
@@ -861,6 +869,10 @@ private fun WindowsVlcPlayerSurface(
                 ),
             )
             if (playWhenReady) {
+                DesktopRuntimeDiagnostics.info(
+                    tag = "PlayerDesktop",
+                    message = "Calling VLC player.resume() for playerId=$playerInstanceId",
+                )
                 player.resume()
             }
         } catch (e: Throwable) {
@@ -913,6 +925,10 @@ private fun WindowsVlcPlayerSurface(
     }
 
     LaunchedEffect(controller) {
+        DesktopRuntimeDiagnostics.info(
+            tag = "PlayerDesktop",
+            message = "VLC controller bound to playerId=$playerInstanceId controllerId=${Integer.toHexString(System.identityHashCode(controller))}",
+        )
         currentOnControllerReady(controller)
     }
 
@@ -939,6 +955,11 @@ private fun WindowsVlcPlayerSurface(
 
     LaunchedEffect(player) {
         player.playbackState.collectLatest { state ->
+            val bitmap = player.surface.bitmap
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "VLC playbackState=$state playerId=$playerInstanceId surfaceSize=${surfaceSize.width}x${surfaceSize.height} bitmap=${bitmap?.width ?: 0}x${bitmap?.height ?: 0}",
+            )
             if (state == PlaybackState.ERROR) {
                 currentOnError("Playback error")
             } else if (fatalErrorMessage == null) {
@@ -947,9 +968,31 @@ private fun WindowsVlcPlayerSurface(
         }
     }
 
+    LaunchedEffect(player) {
+        snapshotFlow {
+            player.surface.bitmap?.let { "${it.width}x${it.height}" } ?: "<null>"
+        }.collectLatest { bitmapSize ->
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "VLC surface bitmap update playerId=$playerInstanceId bitmap=$bitmapSize surfaceSize=${surfaceSize.width}x${surfaceSize.height}",
+            )
+        }
+    }
+
     VlcMediampPlayerSurface(
         mediampPlayer = player,
-        modifier = modifier.background(Color.Black),
+        modifier = modifier
+            .background(Color.Black)
+            .onGloballyPositioned { coordinates ->
+                val newSize = coordinates.size
+                if (newSize != surfaceSize) {
+                    surfaceSize = newSize
+                    DesktopRuntimeDiagnostics.info(
+                        tag = "PlayerDesktop",
+                        message = "VLC compose surface measured playerId=$playerInstanceId size=${newSize.width}x${newSize.height}",
+                    )
+                }
+            },
     )
 }
 

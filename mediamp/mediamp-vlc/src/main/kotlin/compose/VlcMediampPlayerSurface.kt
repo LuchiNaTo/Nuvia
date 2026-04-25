@@ -37,17 +37,19 @@ public fun VlcMediampPlayerSurface(
     }
     val aspectRatioMode by mediampPlayer.features[VideoAspectRatio.Key]?.mode?.collectAsState() 
         ?: return // Return early if VideoAspectRatio feature is not available
+    @OptIn(InternalMediampApi::class)
+    val bitmap = mediampPlayer.surface.bitmap
     
     @OptIn(InternalMediampApi::class)
     Canvas(modifier) {
-        val bitmap = mediampPlayer.surface.bitmap ?: return@Canvas
+        val bitmapToDraw = bitmap ?: return@Canvas
         frameSizeCalculator.calculate(
-            IntSize(bitmap.width, bitmap.height),
+            IntSize(bitmapToDraw.width, bitmapToDraw.height),
             Size(size.width, size.height),
             aspectRatioMode,
         )
         drawImage(
-            bitmap,
+            bitmapToDraw,
             dstSize = frameSizeCalculator.dstSize,
             dstOffset = frameSizeCalculator.dstOffset,
             filterQuality = FilterQuality.High,

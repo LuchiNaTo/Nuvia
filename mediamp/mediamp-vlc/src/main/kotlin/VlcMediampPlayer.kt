@@ -127,7 +127,7 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     init {
         backgroundScope.launch {
             playbackState.collect {
-                surface.enableRendering.value = it == PlaybackState.PLAYING
+                surface.enableRendering.value = it >= PlaybackState.READY
             }
         }
     }
