@@ -40,6 +40,7 @@ import com.nuvio.app.features.streams.StreamItem
 import com.sun.jna.Native
 import com.sun.jna.Pointer
 import java.awt.BorderLayout
+import java.awt.Canvas
 import java.awt.Component
 import java.awt.Panel
 import java.net.HttpURLConnection
@@ -73,7 +74,6 @@ import org.openani.mediamp.source.MediaExtraFiles
 import org.openani.mediamp.source.Subtitle as MediampSubtitleFile
 import org.openani.mediamp.source.UriMediaData
 import org.openani.mediamp.vlc.VlcMediampPlayer
-import org.openani.mediamp.vlc.compose.VlcMediampPlayerSurface
 
 private val isMacOS: Boolean by lazy {
     System.getProperty("os.name")?.lowercase()?.contains("mac") == true
@@ -713,6 +713,7 @@ private fun WindowsVlcPlayerSurface(
     val currentOnSnapshot by rememberUpdatedState(onSnapshot)
     val currentOnError by rememberUpdatedState(onError)
     var surfaceSize by remember { mutableStateOf(IntSize.Zero) }
+    var surfaceAttached by remember { mutableStateOf(false) }
 
     var fatalErrorMessage by remember { mutableStateOf<String?>(null) }
     var playerResult by remember { mutableStateOf<Result<VlcMediampPlayer>?>(null) }
@@ -725,6 +726,20 @@ private fun WindowsVlcPlayerSurface(
                 headers = sourceHeaders,
             ),
         )
+    }
+    val renderSurface = remember {
+        Canvas().apply {
+            background = java.awt.Color.BLACK
+            isFocusable = false
+            ignoreRepaint = true
+        }
+    }
+    val renderHost = remember(renderSurface) {
+        JPanel(BorderLayout()).apply {
+            background = java.awt.Color.BLACK
+            isOpaque = true
+            add(renderSurface, BorderLayout.CENTER)
+        }
     }
 
     fun reportFatalFailure(
@@ -829,6 +844,7 @@ private fun WindowsVlcPlayerSurface(
             },
         )
         onDispose {
+            surfaceAttached = false
             DesktopPlayerGestureBridge.unregister(player)
             runCatching { player.close() }
                 .onFailure { error ->
@@ -841,7 +857,26 @@ private fun WindowsVlcPlayerSurface(
         }
     }
 
-    LaunchedEffect(player, mediaRequest) {
+    LaunchedEffect(player, renderSurface, fatalErrorMessage) {
+        if (fatalErrorMessage != null || surfaceAttached) return@LaunchedEffect
+
+        try {
+            awaitVlcRenderSurfaceReadyOrThrow(renderSurface)
+            player.attachNativeEmbeddedVideoSurface(renderSurface)
+            surfaceAttached = true
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "VLC native embedded surface attached. playerId=$playerInstanceId size=${renderSurface.width}x${renderSurface.height}",
+            )
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            reportFatalFailure("native surface attach", e)
+        }
+    }
+
+    LaunchedEffect(player, mediaRequest, surfaceAttached) {
+        if (!surfaceAttached) return@LaunchedEffect
+
         try {
             currentOnError(null)
 
@@ -881,7 +916,9 @@ private fun WindowsVlcPlayerSurface(
         }
     }
 
-    LaunchedEffect(player, playWhenReady) {
+    LaunchedEffect(player, playWhenReady, surfaceAttached) {
+        if (!surfaceAttached) return@LaunchedEffect
+
         runCatching {
             val state = player.getCurrentPlaybackState()
             if (playWhenReady && (state == PlaybackState.READY || state == PlaybackState.PAUSED || state == PlaybackState.PAUSED_BUFFERING)) {
@@ -955,10 +992,9 @@ private fun WindowsVlcPlayerSurface(
 
     LaunchedEffect(player) {
         player.playbackState.collectLatest { state ->
-            val bitmap = player.surface.bitmap
             DesktopRuntimeDiagnostics.info(
                 tag = "PlayerDesktop",
-                message = "VLC playbackState=$state playerId=$playerInstanceId surfaceSize=${surfaceSize.width}x${surfaceSize.height} bitmap=${bitmap?.width ?: 0}x${bitmap?.height ?: 0}",
+                message = "VLC playbackState=$state playerId=$playerInstanceId surfaceMode=${player.currentVideoSurfaceMode()} surfaceAttached=$surfaceAttached surfaceSize=${surfaceSize.width}x${surfaceSize.height}",
             )
             if (state == PlaybackState.ERROR) {
                 currentOnError("Playback error")
@@ -968,19 +1004,8 @@ private fun WindowsVlcPlayerSurface(
         }
     }
 
-    LaunchedEffect(player) {
-        snapshotFlow {
-            player.surface.bitmap?.let { "${it.width}x${it.height}" } ?: "<null>"
-        }.collectLatest { bitmapSize ->
-            DesktopRuntimeDiagnostics.info(
-                tag = "PlayerDesktop",
-                message = "VLC surface bitmap update playerId=$playerInstanceId bitmap=$bitmapSize surfaceSize=${surfaceSize.width}x${surfaceSize.height}",
-            )
-        }
-    }
-
-    VlcMediampPlayerSurface(
-        mediampPlayer = player,
+    SwingPanel(
+        factory = { renderHost },
         modifier = modifier
             .background(Color.Black)
             .onGloballyPositioned { coordinates ->
@@ -993,6 +1018,12 @@ private fun WindowsVlcPlayerSurface(
                     )
                 }
             },
+        update = { host ->
+            host.background = java.awt.Color.BLACK
+            renderHost.background = java.awt.Color.BLACK
+            renderSurface.background = java.awt.Color.BLACK
+            host.revalidate()
+        },
     )
 }
 
@@ -2054,6 +2085,27 @@ private fun readMpvRenderSurfaceWindowId(surface: Component): Long? {
 
     val nativePtr = Native.getComponentPointer(surface) ?: return null
     return Pointer.nativeValue(nativePtr).takeIf { it != 0L }
+}
+
+private suspend fun awaitVlcRenderSurfaceReadyOrThrow(surface: Component) {
+    repeat(40) { attempt ->
+        val ready = withContext(Dispatchers.Main) {
+            surface.isDisplayable && surface.isShowing && surface.width > 0 && surface.height > 0
+        }
+        if (ready) {
+            DesktopRuntimeDiagnostics.info(
+                tag = "PlayerDesktop",
+                message = "VLC render surface ready before player init on attempt ${attempt + 1}: displayable=${surface.isDisplayable}, showing=${surface.isShowing}, size=${surface.width}x${surface.height}",
+            )
+            return
+        }
+        delay(250)
+    }
+
+    error(
+        "VLC render surface never became ready; " +
+            "displayable=${surface.isDisplayable}, showing=${surface.isShowing}, size=${surface.width}x${surface.height}",
+    )
 }
 
 private suspend fun awaitMpvRenderSurfaceWindowIdOrThrow(surface: Component): Long {

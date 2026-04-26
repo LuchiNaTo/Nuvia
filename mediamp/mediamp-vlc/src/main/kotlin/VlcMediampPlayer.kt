@@ -67,8 +67,9 @@ import uk.co.caprica.vlcj.media.MediaSlaveType
 import uk.co.caprica.vlcj.media.TrackType
 import uk.co.caprica.vlcj.player.base.MediaPlayer
 import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter
-import uk.co.caprica.vlcj.player.component.CallbackMediaPlayerComponent
 import uk.co.caprica.vlcj.player.embedded.EmbeddedMediaPlayer
+import uk.co.caprica.vlcj.player.embedded.videosurface.VideoSurface
+import java.awt.Component
 import java.io.File
 import java.net.URI
 import java.util.concurrent.RejectedExecutionException
@@ -86,8 +87,6 @@ import kotlin.math.roundToInt
 public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     MediampPlayer,
     AbstractMediampPlayer<VlcjData>(Dispatchers.Default) {
-
-    private val videoSurfaceMode: String = "BUFFERED_IMAGE_RENDER_CALLBACK_ADAPTER"
 
     private val vlcFactoryArgs = arrayOf(
         "--avcodec-hw=none",
@@ -120,22 +119,6 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     private val mediaPlayerFactory: MediaPlayerFactory = createPlayerLock.withLock {
         VlcRuntimeDiagnostics.info(
             tag = "VlcMediampPlayer",
-            message = "VLC_BACKEND_AB_BUFFERED_IMAGE_RENDERER_ACTIVE_2026_04_26",
-        )
-        VlcRuntimeDiagnostics.info(
-            tag = "VlcMediampPlayer",
-            message = "videoSurfaceMode=$videoSurfaceMode",
-        )
-        VlcRuntimeDiagnostics.info(
-            tag = "VlcMediampPlayer",
-            message = "OLD_SKIA_BYTEBUFFER_PATH_DISABLED",
-        )
-        VlcRuntimeDiagnostics.info(
-            tag = "VlcMediampPlayer",
-            message = "BUFFERED_IMAGE_RENDER_CALLBACK_PATH_ENABLED",
-        )
-        VlcRuntimeDiagnostics.info(
-            tag = "VlcMediampPlayer",
             message = "Creating MediaPlayerFactory with args=${vlcFactoryArgs.joinToString(separator = " ")}",
         )
         MediaPlayerFactory(*vlcFactoryArgs)
@@ -150,17 +133,13 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
 
     @InternalMediampApi
     public val surface: SkiaBitmapVideoSurface = SkiaBitmapVideoSurface()
-
-    private val registeredVideoSurface = createPlayerLock.withLock {
-        val videoSurface = surface.createVideoSurface(mediaPlayerFactory)
-        VlcRuntimeDiagnostics.info(
-            tag = "VlcMediampPlayer",
-            message = "Registering callback video surface type=${videoSurface::class.qualifiedName} helperType=${surface::class.qualifiedName} playerId=${Integer.toHexString(System.identityHashCode(player))} videoSurfaceMode=$videoSurfaceMode",
-        )
-        player.videoSurface().set(videoSurface)
-        videoSurface
-    }
     override val impl: EmbeddedMediaPlayer get() = player
+
+    @Volatile
+    private var activeVideoSurface: VideoSurface? = null
+
+    @Volatile
+    private var activeVideoSurfaceMode: String = "UNATTACHED"
 
     private var lastMedia: SeekableInputCallbackMedia? = null // keep referenced so won't be gc'ed
 
@@ -176,11 +155,48 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
         backgroundScope.launch {
             playbackState.collect {
                 surface.enableRendering.value = it >= PlaybackState.READY
-                VlcRuntimeDiagnostics.info(
-                    tag = "VlcMediampPlayer",
-                    message = "Playback state changed to $it, enableRendering=${surface.enableRendering.value}",
-                )
             }
+        }
+    }
+
+    @InternalMediampApi
+    public fun attachBitmapVideoSurface() {
+        val videoSurface = surface.createVideoSurface(mediaPlayerFactory)
+        attachVideoSurface(
+            videoSurface = videoSurface,
+            mode = "CALLBACK_BITMAP_FALLBACK",
+            detail = "surfaceType=${videoSurface::class.qualifiedName}",
+        )
+    }
+
+    @InternalMediampApi
+    public fun attachNativeEmbeddedVideoSurface(component: Component) {
+        val videoSurface = mediaPlayerFactory.videoSurfaces().newVideoSurface(component)
+        attachVideoSurface(
+            videoSurface = videoSurface,
+            mode = "NATIVE_EMBEDDED_WINDOWS",
+            detail = "component=${component::class.qualifiedName} size=${component.width}x${component.height}",
+        )
+    }
+
+    @InternalMediampApi
+    public fun currentVideoSurfaceMode(): String = activeVideoSurfaceMode
+
+    private fun attachVideoSurface(
+        videoSurface: VideoSurface,
+        mode: String,
+        detail: String,
+    ) {
+        createPlayerLock.withLock {
+            player.videoSurface().set(videoSurface)
+            player.input().enableKeyInputHandling(false)
+            player.input().enableMouseInputHandling(false)
+            activeVideoSurface = videoSurface
+            activeVideoSurfaceMode = mode
+            VlcRuntimeDiagnostics.info(
+                tag = "VlcMediampPlayer",
+                message = "VLC_VIDEO_SURFACE_MODE=$mode playerId=${Integer.toHexString(System.identityHashCode(player))} $detail",
+            )
         }
     }
 
@@ -305,7 +321,7 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                         .joinToString(separator = " | ") { "${it.id()}:${it.description()}" }
                     VlcRuntimeDiagnostics.info(
                         tag = "VlcMediampPlayer",
-                        message = "playing playerId=${Integer.toHexString(System.identityHashCode(player))} videoTrackCount=${player.video().trackCount()} videoTrack=${player.video().track()} videoTracks=$videoTracks videoDimension=${dimension?.width ?: 0}x${dimension?.height ?: 0} audioTrackCount=${player.audio().trackCount()} subtitleTrackCount=${player.subpictures().trackCount()}",
+                        message = "playing playerId=${Integer.toHexString(System.identityHashCode(player))} surfaceMode=$activeVideoSurfaceMode videoTrackCount=${player.video().trackCount()} videoTrack=${player.video().track()} videoTracks=$videoTracks videoDimension=${dimension?.width ?: 0}x${dimension?.height ?: 0} audioTrackCount=${player.audio().trackCount()} subtitleTrackCount=${player.subpictures().trackCount()}",
                     )
                     playbackStateMapper.onPlaying(playbackState.value)?.let {
                         playbackState.value = it
@@ -362,6 +378,13 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                     logger.error { "vlcj player error" }
                     playbackStateMapper.reset()
                     playbackState.value = PlaybackState.ERROR
+                }
+
+                override fun videoOutput(mediaPlayer: MediaPlayer?, newCount: Int) {
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "videoOutput count=$newCount playerId=${Integer.toHexString(System.identityHashCode(player))} surfaceMode=$activeVideoSurfaceMode",
+                    )
                 }
 
                 override fun positionChanged(mediaPlayer: MediaPlayer?, newPosition: Float) {
@@ -694,11 +717,6 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                 VlcRuntimeDiagnostics.info(
                     tag = "VlcMediampPlayer",
                     message = "prepareLibraries discovery result=$discovered",
-                )
-                CallbackMediaPlayerComponent().release()
-                VlcRuntimeDiagnostics.info(
-                    tag = "VlcMediampPlayer",
-                    message = "prepareLibraries warmup callback component released",
                 )
             }
         }

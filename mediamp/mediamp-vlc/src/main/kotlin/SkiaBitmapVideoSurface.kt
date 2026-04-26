@@ -30,7 +30,6 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater
 
 @InternalMediampApi
 public class SkiaBitmapVideoSurface {
-    private val videoSurfaceMode: String = "BUFFERED_IMAGE_RENDER_CALLBACK_ADAPTER"
     private val composeBitmap = mutableStateOf<ImageBitmap?>(null)
 
     public val enableRendering: MutableStateFlow<Boolean> = MutableStateFlow(false)
@@ -85,7 +84,7 @@ public class SkiaBitmapVideoSurface {
         )
         VlcRuntimeDiagnostics.info(
             tag = "SkiaBitmapVideoSurface",
-            message = "createVideoSurface surfaceType=${surface::class.qualifiedName} bufferFormatCallback=${bufferFormatCallback::class.qualifiedName} renderCallback=${renderCallback::class.qualifiedName} videoSurfaceMode=$videoSurfaceMode BUFFERED_IMAGE_RENDER_CALLBACK_PATH_ENABLED",
+            message = "VLC_VIDEO_SURFACE_MODE=CALLBACK_BITMAP_FALLBACK surfaceType=${surface::class.qualifiedName}",
         )
         return surface
     }
@@ -98,10 +97,6 @@ public class SkiaBitmapVideoSurface {
         pitchBytes = pitch
         lineCount = lines
         currentRenderCallback?.setImageBuffer(image)
-        VlcRuntimeDiagnostics.info(
-            tag = "SkiaBitmapVideoSurface",
-            message = "newVideoBuffer bitmap=${width}x${height} pitch=$pitch lines=$lines dataLength=${(image.raster.dataBuffer as DataBufferInt).data.size} videoSurfaceMode=$videoSurfaceMode",
-        )
     }
 
     private inner class OfficialBufferFormatCallback(
@@ -112,13 +107,7 @@ public class SkiaBitmapVideoSurface {
                 val bufferFormat = RV32BufferFormat(sourceWidth, sourceHeight)
                 val pitch = bufferFormat.pitches.firstOrNull() ?: (bufferFormat.width * 4)
                 val lines = bufferFormat.lines.firstOrNull() ?: bufferFormat.height
-                val bufferBytes = bufferFormat.pitches.zip(bufferFormat.lines)
-                    .sumOf { (currentPitch, currentLines) -> currentPitch.toLong() * currentLines.toLong() }
                 newVideoBuffer(bufferFormat.width, bufferFormat.height, pitch, lines)
-                VlcRuntimeDiagnostics.info(
-                    tag = "SkiaBitmapVideoSurface",
-                    message = "getBufferFormat width=$sourceWidth height=$sourceHeight returned=${bufferFormat::class.qualifiedName} chroma=${bufferFormat.chroma} pitches=${bufferFormat.pitches.joinToString()} lines=${bufferFormat.lines.joinToString()} planeCount=${bufferFormat.planeCount} bufferBytes=$bufferBytes videoSurfaceMode=$videoSurfaceMode",
-                )
                 bufferFormat
             } catch (t: Throwable) {
                 VlcRuntimeDiagnostics.error(
@@ -131,11 +120,6 @@ public class SkiaBitmapVideoSurface {
         }
 
         override fun allocatedBuffers(buffers: Array<ByteBuffer>) {
-            val bufferBytes = buffers.sumOf { it.capacity().toLong() }
-            VlcRuntimeDiagnostics.info(
-                tag = "SkiaBitmapVideoSurface",
-                message = "allocatedBuffers count=${buffers.size} bufferBytes=$bufferBytes bitmap=${formatWidth}x${formatHeight} pitch=$pitchBytes lines=$lineCount renderCallback=${renderCallback::class.qualifiedName} videoSurfaceMode=$videoSurfaceMode",
-            )
             super.allocatedBuffers(buffers)
         }
     }
@@ -150,12 +134,6 @@ public class SkiaBitmapVideoSurface {
             val allowedDrawFramesValue = ALLOWED_DRAW_FRAMES.get(this@SkiaBitmapVideoSurface)
 
             if (!enableRendering.value) {
-                if (frameIndex <= 5 || frameIndex % 120 == 0) {
-                    VlcRuntimeDiagnostics.info(
-                        tag = "SkiaBitmapVideoSurface",
-                        message = "display frame=$frameIndex skipped enableRendering=false allowedDrawFrames=$allowedDrawFramesValue",
-                    )
-                }
                 if (allowedDrawFramesValue <= 0) {
                     return
                 }
@@ -166,20 +144,10 @@ public class SkiaBitmapVideoSurface {
 
             val image = currentImage
             if (image == null) {
-                VlcRuntimeDiagnostics.warn(
-                    tag = "SkiaBitmapVideoSurface",
-                    message = "display frame=$frameIndex skipped because currentImage is null",
-                )
                 return
             }
 
             composeBitmap.value = image.toComposeImageBitmap()
-            if (frameIndex <= 5 || frameIndex % 120 == 0) {
-                VlcRuntimeDiagnostics.info(
-                    tag = "SkiaBitmapVideoSurface",
-                    message = "display frame=$frameIndex image=${image.width}x${image.height} bufferInts=${buffer.size} composeBitmap=${composeBitmap.value?.width ?: 0}x${composeBitmap.value?.height ?: 0} videoSurfaceMode=$videoSurfaceMode",
-                )
-            }
         }
     }
 

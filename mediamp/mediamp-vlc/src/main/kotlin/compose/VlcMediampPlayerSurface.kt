@@ -10,6 +10,7 @@ package org.openani.mediamp.vlc.compose
 
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -27,6 +28,7 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
+@OptIn(InternalMediampApi::class)
 @Composable
 public fun VlcMediampPlayerSurface(
     mediampPlayer: VlcMediampPlayer,
@@ -34,6 +36,9 @@ public fun VlcMediampPlayerSurface(
 ) {
     val frameSizeCalculator = remember {
         FrameSizeCalculator()
+    }
+    LaunchedEffect(mediampPlayer) {
+        mediampPlayer.attachBitmapVideoSurface()
     }
     val aspectRatioMode by mediampPlayer.features[VideoAspectRatio.Key]?.mode?.collectAsState() 
         ?: return // Return early if VideoAspectRatio feature is not available
