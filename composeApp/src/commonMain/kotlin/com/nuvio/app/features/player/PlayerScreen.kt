@@ -210,6 +210,10 @@ fun PlayerScreen(
         var playerController by remember { mutableStateOf<PlayerEngineController?>(null) }
         var playerControllerSourceUrl by remember { mutableStateOf<String?>(null) }
         var activeMediaGeneration by remember { mutableStateOf(0) }
+        // When true we suppress automatic "next episode" behaviour and ignore ended/completed
+        // events until the manual switch completes (new media ready/playing). Set by manual
+        // actions (source/episode/subtitle selection) and cleared once new media is stable.
+        var manualSwitchInProgress by remember { mutableStateOf(false) }
         var errorMessage by remember { mutableStateOf<String?>(null) }
         var scrubbingPositionMs by remember { mutableStateOf<Long?>(null) }
         var pausedOverlayVisible by remember { mutableStateOf(false) }
@@ -820,7 +824,10 @@ fun PlayerScreen(
                     bingeGroup = stream.behaviorHints.bingeGroup,
                 )
             }
-            playerLog.i { "switchToSource requested url=${url.take(64)} generation=${activeMediaGeneration + 1}" }
+            playerLog.i { "manual switchToSource start url=${url.take(64)} generation=${activeMediaGeneration + 1}" }
+            // Mark manual transition in progress so we ignore stale ended/auto-next events
+            manualSwitchInProgress = true
+            showNextEpisodeCard = false
             activeSourceUrl = url
             activeSourceAudioUrl = null
             activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -881,7 +888,9 @@ fun PlayerScreen(
                     bingeGroup = stream.behaviorHints.bingeGroup,
                 )
             }
-            playerLog.i { "switchToEpisodeStream requested url=${url.take(64)} generation=${activeMediaGeneration + 1} episode=${episode.id}" }
+            playerLog.i { "manual switchToEpisodeStream start url=${url.take(64)} generation=${activeMediaGeneration + 1} episode=${episode.id}" }
+            // Mark manual transition in progress so we ignore stale ended/auto-next events
+            manualSwitchInProgress = true
             activeSourceUrl = url
             activeSourceAudioUrl = null
             activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -928,6 +937,9 @@ fun PlayerScreen(
                 ?.let { (it / 100f).coerceIn(0f, 1f) }
             val epResumePositionMs = epEntry?.lastPositionMs?.takeIf { it > 0L } ?: 0L
 
+            playerLog.i { "manual switchToDownloadedEpisode start url=${localFileUri.take(64)} generation=${activeMediaGeneration + 1} episode=${episode.id}" }
+            manualSwitchInProgress = true
+            showNextEpisodeCard = false
             activeSourceUrl = localFileUri
             activeSourceAudioUrl = null
             activeSourceHeaders = emptyMap()
@@ -1393,7 +1405,7 @@ fun PlayerScreen(
             } else null
         }
 
-        // Show next episode card at threshold
+        // Show next episode card at threshold (suppress while manual switch in progress)
         LaunchedEffect(
             playbackSnapshot.positionMs,
             playbackSnapshot.durationMs,
@@ -1403,6 +1415,14 @@ fun PlayerScreen(
             playerSettingsUiState.nextEpisodeThresholdPercent,
             playerSettingsUiState.nextEpisodeThresholdMinutesBeforeEnd,
         ) {
+            if (manualSwitchInProgress) {
+                if (showNextEpisodeCard) {
+                    showNextEpisodeCard = false
+                    playerLog.i { "Hiding next episode card during manual switch generation=$activeMediaGeneration" }
+                }
+                return@LaunchedEffect
+            }
+
             if (nextEpisodeInfo == null || playbackSnapshot.durationMs <= 0L) {
                 showNextEpisodeCard = false
                 return@LaunchedEffect
@@ -1419,6 +1439,7 @@ fun PlayerScreen(
                 showNextEpisodeCard = true
                 // Auto-play if enabled
                 if (playerSettingsUiState.streamAutoPlayNextEpisodeEnabled && nextEpisodeInfo?.hasAired == true) {
+                    playerLog.i { "Auto-next triggered generation=$activeMediaGeneration reason=threshold" }
                     playNextEpisode()
                 }
             } else if (!shouldShow) {
@@ -1428,18 +1449,55 @@ fun PlayerScreen(
 
         // Auto-play on video ended if next episode card isn't already showing
         LaunchedEffect(playbackSnapshot.isEnded, nextEpisodeInfo) {
-            if (playbackSnapshot.isEnded && nextEpisodeInfo != null && !showNextEpisodeCard) {
-                // Guard against ended/completed events from an obsolete player during media switches.
-                // Only handle ended when the controller is bound to the current source and initial load completed.
-                if (playerControllerSourceUrl != activeSourceUrl || !initialLoadCompleted) {
-                    playerLog.i { "Ignoring ended event - obsolete or still loading: controllerSource=$playerControllerSourceUrl activeSource=$activeSourceUrl initialLoad=$initialLoadCompleted" }
-                    return@LaunchedEffect
-                }
+            if (!playbackSnapshot.isEnded) return@LaunchedEffect
 
-                showNextEpisodeCard = true
-                if (playerSettingsUiState.streamAutoPlayNextEpisodeEnabled && nextEpisodeInfo?.hasAired == true) {
-                    playNextEpisode()
+            playerLog.i { "ended event received generation=$activeMediaGeneration position=${playbackSnapshot.positionMs} duration=${playbackSnapshot.durationMs} manualSwitch=$manualSwitchInProgress controllerSource=$playerControllerSourceUrl activeSource=$activeSourceUrl" }
+
+            if (nextEpisodeInfo == null || showNextEpisodeCard) return@LaunchedEffect
+
+            // If a manual switch is in progress ignore ended events entirely
+            if (manualSwitchInProgress) {
+                playerLog.i { "Ignoring ended event due to manualSwitchInProgress generation=$activeMediaGeneration" }
+                return@LaunchedEffect
+            }
+
+            // Guard against ended/completed events from an obsolete player during media switches.
+            // Only handle ended when the controller is bound to the current source and initial load completed.
+            if (playerControllerSourceUrl != activeSourceUrl || !initialLoadCompleted) {
+                playerLog.i { "Ignoring ended event - obsolete or still loading: controllerSource=$playerControllerSourceUrl activeSource=$activeSourceUrl initialLoad=$initialLoadCompleted generation=$activeMediaGeneration" }
+                return@LaunchedEffect
+            }
+
+            showNextEpisodeCard = true
+            if (playerSettingsUiState.streamAutoPlayNextEpisodeEnabled && nextEpisodeInfo?.hasAired == true) {
+                playerLog.i { "Auto-next triggered generation=$activeMediaGeneration reason=ended" }
+                playNextEpisode()
+            }
+        }
+
+        // Monitor manual switch progress and clear when new media is stable or after a timeout
+        LaunchedEffect(manualSwitchInProgress, activeMediaGeneration) {
+            if (!manualSwitchInProgress) return@LaunchedEffect
+            val gen = activeMediaGeneration
+            playerLog.i { "manual switch monitor started generation=$gen" }
+
+            // Poll short-lived until we detect the new controller/source has loaded and started
+            while (manualSwitchInProgress && gen == activeMediaGeneration) {
+                if (playerControllerSourceUrl == activeSourceUrl && initialLoadCompleted) {
+                    if (playbackSnapshot.durationMs > 0L && (playbackSnapshot.isPlaying || playbackSnapshot.positionMs > 0L)) {
+                        playerLog.i { "manual switch ended generation=$gen controllerSource=$playerControllerSourceUrl activeSource=$activeSourceUrl pos=${playbackSnapshot.positionMs} dur=${playbackSnapshot.durationMs}" }
+                        manualSwitchInProgress = false
+                        showNextEpisodeCard = false
+                        break
+                    }
                 }
+                kotlinx.coroutines.delay(250)
+            }
+
+            // Fallback timeout to avoid permanent suppression
+            if (manualSwitchInProgress && gen == activeMediaGeneration) {
+                playerLog.i { "manual switch timeout clearing generation=$gen" }
+                manualSwitchInProgress = false
             }
         }
 
@@ -2085,7 +2143,12 @@ fun PlayerScreen(
                     selectedAddonSubtitleId = addon.id
                     selectedSubtitleIndex = -1
                     useCustomSubtitles = true
-                    playerLog.d { "selectAddonSubtitle id=${addon.id} url=${addon.url.take(64)} controllerPresent=${playerController != null} generation=$activeMediaGeneration" }
+                    playerLog.i { "manual selectAddonSubtitle start id=${addon.id} url=${addon.url.take(64)} generation=${activeMediaGeneration + 1}" }
+                    // Treat subtitle addon reload like a manual media transition: bump generation
+                    // and suppress automatic next/ended handling until reload completes.
+                    manualSwitchInProgress = true
+                    showNextEpisodeCard = false
+                    activeMediaGeneration += 1
                     playerController?.setSubtitleUri(addon.url)
                 },
                 onFetchAddonSubtitles = ::fetchAddonSubtitlesForActiveItem,
