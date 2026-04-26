@@ -3093,19 +3093,67 @@ actual fun NativePlayerOverlay(
     // Keep a reference to the overlay AWT window so we can manipulate z-order safely.
     val awtWindowRef = remember { java.util.concurrent.atomic.AtomicReference<java.awt.Window?>(null) }
 
-    fun raiseOverlayWindow() {
+    // Throttled overlay raise to avoid spamming toFront() during continuous resize/move.
+    // Uses a single shared TimerTask to schedule a final raise within `minIntervalMs`.
+    val _lastRaiseAt = remember { java.util.concurrent.atomic.AtomicLong(0L) }
+    val _pendingRaise = remember { java.util.concurrent.atomic.AtomicReference<java.util.TimerTask?>(null) }
+    val _raiseTimer = remember { java.util.Timer("nuvio-overlay-raise", true) }
+    val _lastRaiseLogAt = remember { java.util.concurrent.atomic.AtomicLong(0L) }
+
+    fun scheduleRaiseOverlay(minIntervalMs: Long = 50L) {
         val wnd = awtWindowRef.get() ?: return
-        javax.swing.SwingUtilities.invokeLater {
-            runCatching {
-                if (!wnd.isDisplayable || !wnd.isVisible) return@runCatching
-                val prev = wnd.isAlwaysOnTop
-                try {
-                    if (!prev) wnd.isAlwaysOnTop = true
-                    wnd.toFront()
-                } finally {
-                    if (!prev) wnd.isAlwaysOnTop = false
+        val now = System.currentTimeMillis()
+        val last = _lastRaiseAt.get()
+
+        if (now - last >= minIntervalMs) {
+            javax.swing.SwingUtilities.invokeLater {
+                runCatching {
+                    if (!wnd.isDisplayable || !wnd.isVisible) return@runCatching
+                    val prev = wnd.isAlwaysOnTop
+                    try {
+                        if (!prev) wnd.isAlwaysOnTop = true
+                        wnd.toFront()
+                    } finally {
+                        if (!prev) wnd.isAlwaysOnTop = false
+                    }
+                    _lastRaiseAt.set(System.currentTimeMillis())
+                    // Log sparsely to avoid log spam
+                    val lastLog = _lastRaiseLogAt.get()
+                    if (System.currentTimeMillis() - lastLog > 5_000L) {
+                        DesktopRuntimeDiagnostics.info("PlayerDesktop", "Overlay raised to front")
+                        _lastRaiseLogAt.set(System.currentTimeMillis())
+                    }
                 }
-                DesktopRuntimeDiagnostics.info("PlayerDesktop", "Overlay raised to front")
+            }
+        } else {
+            // schedule a single task to run after the remaining interval
+            _pendingRaise.getAndSet(null)?.cancel()
+            val task = object : java.util.TimerTask() {
+                override fun run() {
+                    javax.swing.SwingUtilities.invokeLater {
+                        runCatching {
+                            if (!wnd.isDisplayable || !wnd.isVisible) return@runCatching
+                            val prev = wnd.isAlwaysOnTop
+                            try {
+                                if (!prev) wnd.isAlwaysOnTop = true
+                                wnd.toFront()
+                            } finally {
+                                if (!prev) wnd.isAlwaysOnTop = false
+                            }
+                            _lastRaiseAt.set(System.currentTimeMillis())
+                            val lastLog = _lastRaiseLogAt.get()
+                            if (System.currentTimeMillis() - lastLog > 5_000L) {
+                                DesktopRuntimeDiagnostics.info("PlayerDesktop", "Overlay raised to front")
+                                _lastRaiseLogAt.set(System.currentTimeMillis())
+                            }
+                        }
+                    }
+                    _pendingRaise.compareAndSet(this, null)
+                }
+            }
+            if (_pendingRaise.compareAndSet(null, task)) {
+                val delayMs = (minIntervalMs - (now - last)).coerceAtLeast(1L)
+                _raiseTimer.schedule(task, delayMs)
             }
         }
     }
@@ -3132,12 +3180,12 @@ actual fun NativePlayerOverlay(
         val componentListener = object : ComponentAdapter() {
             override fun componentResized(e: ComponentEvent) {
                 refresh()
-                raiseOverlayWindow()
+                scheduleRaiseOverlay()
             }
 
             override fun componentMoved(e: ComponentEvent) {
                 refresh()
-                raiseOverlayWindow()
+                scheduleRaiseOverlay()
             }
 
             override fun componentShown(e: ComponentEvent) = refresh()
@@ -3156,17 +3204,17 @@ actual fun NativePlayerOverlay(
 
             override fun windowDeiconified(e: java.awt.event.WindowEvent?) {
                 refresh()
-                raiseOverlayWindow()
+                scheduleRaiseOverlay()
             }
 
             override fun windowActivated(e: java.awt.event.WindowEvent?) {
                 refresh()
-                raiseOverlayWindow()
+                scheduleRaiseOverlay()
             }
 
             override fun windowGainedFocus(e: java.awt.event.WindowEvent?) {
                 refresh()
-                raiseOverlayWindow()
+                scheduleRaiseOverlay()
             }
         }
 
@@ -3176,7 +3224,7 @@ actual fun NativePlayerOverlay(
         mainFrame?.addWindowStateListener(windowAdapter)
         javax.swing.SwingUtilities.invokeLater {
             refresh()
-            raiseOverlayWindow()
+            scheduleRaiseOverlay()
         }
 
         onDispose {
@@ -3214,8 +3262,8 @@ actual fun NativePlayerOverlay(
                 }.onFailure {
                     DesktopRuntimeDiagnostics.warn("PlayerDesktop", "Failed to set overlay bounds", it)
                 }
-                // Ensure overlay is in front after a bounds change.
-                raiseOverlayWindow()
+                // Ensure overlay is in front after a bounds change (debounced).
+                scheduleRaiseOverlay()
             }
         }
     }

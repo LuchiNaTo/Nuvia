@@ -1496,20 +1496,10 @@ fun PlayerScreen(
                         val stream = allStreams.firstOrNull { it.directPlaybackUrl == url }
                             ?: return@setOnSourceStreamSelectedCallback
                         switchToSource(stream)
-                        val headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
-                        val headersJson = headers.takeIf { it.isNotEmpty() }?.entries
-                            ?.joinToString(",", "{", "}") { (k, v) -> "\"${k}\":\"${v}\"" }
-                        controller.switchSource(url, null, headersJson)
-                        controller.setMetadata(
-                            title = title,
-                            streamTitle = activeStreamTitle,
-                            providerName = activeProviderName,
-                            seasonNumber = activeSeasonNumber,
-                            episodeNumber = activeEpisodeNumber,
-                            episodeTitle = activeEpisodeTitle,
-                            artwork = backdropArtwork,
-                            logo = logo,
-                        )
+                        // We update the active source in the PlayerScreen state (switchToSource),
+                        // which will drive the PlayerSurface -> setMediaData path. Avoid calling
+                        // controller.switchSource here to prevent duplicate reloads on the old
+                        // controller instance.
                     }
                     controller.setOnSourceFilterChangedCallback { addonId ->
                         PlayerStreamsRepository.selectSourceFilter(addonId)
@@ -1556,20 +1546,10 @@ fun PlayerScreen(
                         val episode = playerMetaVideos.firstOrNull { it.id == episodeStreamsPanelState.selectedEpisode?.id }
                             ?: return@setOnEpisodeStreamSelectedCallback
                         switchToEpisodeStream(stream, episode)
-                        val headers = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
-                        val headersJson = headers.takeIf { it.isNotEmpty() }?.entries
-                            ?.joinToString(",", "{", "}") { (k, v) -> "\"${k}\":\"${v}\"" }
-                        controller.switchSource(url, null, headersJson)
-                        controller.setMetadata(
-                            title = title,
-                            streamTitle = activeStreamTitle,
-                            providerName = activeProviderName,
-                            seasonNumber = activeSeasonNumber,
-                            episodeNumber = activeEpisodeNumber,
-                            episodeTitle = activeEpisodeTitle,
-                            artwork = backdropArtwork,
-                            logo = logo,
-                        )
+                        // We update the active source in the PlayerScreen state (switchToEpisodeStream),
+                        // which will drive the PlayerSurface -> setMediaData path. Avoid calling
+                        // controller.switchSource here to prevent duplicate reloads on the old
+                        // controller instance.
                     }
                     controller.setOnEpisodeFilterChangedCallback { addonId ->
                         PlayerStreamsRepository.selectEpisodeStreamsFilter(addonId)
