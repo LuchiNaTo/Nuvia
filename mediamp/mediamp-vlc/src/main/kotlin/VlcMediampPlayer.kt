@@ -70,6 +70,7 @@ import uk.co.caprica.vlcj.player.base.MediaPlayerEventAdapter
 import uk.co.caprica.vlcj.player.component.CallbackMediaPlayerComponent
 import uk.co.caprica.vlcj.player.embedded.EmbeddedMediaPlayer
 import java.io.File
+import java.net.URI
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.contracts.ExperimentalContracts
@@ -86,6 +87,21 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     MediampPlayer,
     AbstractMediampPlayer<VlcjData>(Dispatchers.Default) {
 
+    private val videoSurfaceMode: String = "BUFFERED_IMAGE_RENDER_CALLBACK_ADAPTER"
+
+    private val vlcFactoryArgs = arrayOf(
+        "--avcodec-hw=none",
+        "--no-snapshot-preview",
+        "--intf=dummy",
+        "--file-logging",
+        "--logfile=${VlcRuntimeDiagnostics.nativeLogFile}",
+        "--verbose=2",
+    )
+
+    private val forcedSoftwareDecodeMediaOptions = listOf(
+        ":avcodec-hw=none",
+    )
+
     private val backgroundScope: CoroutineScope = CoroutineScope(
         parentCoroutineContext + SupervisorJob(parentCoroutineContext[Job.Key]),
     ).apply {
@@ -97,20 +113,52 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     //    val mediaPlayerFactory = MediaPlayerFactory(
 //        "--video-title=vlcj video output",
 //        "--no-snapshot-preview",
-//        "--intf=dummy",
+    //        "--intf=dummy",
 //        "-v"
 //    )
 
+    private val mediaPlayerFactory: MediaPlayerFactory = createPlayerLock.withLock {
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "VLC_BACKEND_AB_BUFFERED_IMAGE_RENDERER_ACTIVE_2026_04_26",
+        )
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "videoSurfaceMode=$videoSurfaceMode",
+        )
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "OLD_SKIA_BYTEBUFFER_PATH_DISABLED",
+        )
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "BUFFERED_IMAGE_RENDER_CALLBACK_PATH_ENABLED",
+        )
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "Creating MediaPlayerFactory with args=${vlcFactoryArgs.joinToString(separator = " ")}",
+        )
+        MediaPlayerFactory(*vlcFactoryArgs)
+    }
+
+    @InternalMediampApi
     public val player: EmbeddedMediaPlayer = createPlayerLock.withLock {
-        MediaPlayerFactory("-v")
+        mediaPlayerFactory
             .mediaPlayers()
             .newEmbeddedMediaPlayer()
     }
 
     @InternalMediampApi
-    public val surface: SkiaBitmapVideoSurface = SkiaBitmapVideoSurface().apply {
-        player.videoSurface().set(this) // 只能 attach 一次
-        attach(player)
+    public val surface: SkiaBitmapVideoSurface = SkiaBitmapVideoSurface()
+
+    private val registeredVideoSurface = createPlayerLock.withLock {
+        val videoSurface = surface.createVideoSurface(mediaPlayerFactory)
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "Registering callback video surface type=${videoSurface::class.qualifiedName} helperType=${surface::class.qualifiedName} playerId=${Integer.toHexString(System.identityHashCode(player))} videoSurfaceMode=$videoSurfaceMode",
+        )
+        player.videoSurface().set(videoSurface)
+        videoSurface
     }
     override val impl: EmbeddedMediaPlayer get() = player
 
@@ -128,6 +176,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
         backgroundScope.launch {
             playbackState.collect {
                 surface.enableRendering.value = it >= PlaybackState.READY
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "Playback state changed to $it, enableRendering=${surface.enableRendering.value}",
+                )
             }
         }
     }
@@ -136,6 +188,26 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
         override val mediaData: MediaData,
         internal val setPlay: () -> Unit,
     ) : Data(mediaData)
+
+    private fun buildPlaybackOptions(data: UriMediaData): Array<String> {
+        val lowerHeaders = data.headers.mapKeys { it.key.lowercase() }
+        return buildList {
+            add("http-user-agent=${lowerHeaders["user-agent"] ?: "Mozilla/5.0"}")
+            val referer = lowerHeaders["referer"]
+            if (referer != null) {
+                add("http-referrer=${referer}")
+            }
+            addAll(forcedSoftwareDecodeMediaOptions)
+            addAll(data.options)
+        }.toTypedArray()
+    }
+
+    private fun buildPlaybackOptions(data: SeekableInputMediaData): Array<String> {
+        return buildList {
+            addAll(forcedSoftwareDecodeMediaOptions)
+            addAll(data.options)
+        }.toTypedArray()
+    }
 
     private val screenshots = VlcScreenshots(player)
     private val playbackSpeed = VlcPlaybackSpeed(player)
@@ -158,6 +230,11 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
         player.events().addMediaEventListener(
             object : MediaEventAdapter() {
                 override fun mediaParsedChanged(media: Media, newStatus: MediaParsedStatus) {
+                    val dimension = player.video().videoDimension()
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "mediaParsedChanged status=$newStatus playerId=${Integer.toHexString(System.identityHashCode(player))} videoTrackCount=${player.video().trackCount()} videoTrack=${player.video().track()} videoDimension=${dimension?.width ?: 0}x${dimension?.height ?: 0}",
+                    )
                     if (playbackState.value <= PlaybackState.FINISHED) {
                         return
                     }
@@ -191,6 +268,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                 }
 
                 override fun buffering(mediaPlayer: MediaPlayer?, newCache: Float) {
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "buffering=$newCache playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                    )
                     buffering.bufferedPercentage.value = newCache.roundToInt().coerceIn(0, 100)
                     playbackStateMapper.onBuffering(playbackState.value, newCache)?.let {
                         playbackState.value = it
@@ -198,6 +279,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                 }
 
                 override fun mediaPlayerReady(mediaPlayer: MediaPlayer?) {
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "mediaPlayerReady playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                    )
                     player.submit {
                         audioLevelController.setVolume(audioLevelController.volume.value)
                         audioLevelController.setMute(audioLevelController.isMute.value)
@@ -215,6 +300,13 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                 }
 
                 override fun playing(mediaPlayer: MediaPlayer) {
+                    val dimension = player.video().videoDimension()
+                    val videoTracks = player.video().trackDescriptions()
+                        .joinToString(separator = " | ") { "${it.id()}:${it.description()}" }
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "playing playerId=${Integer.toHexString(System.identityHashCode(player))} videoTrackCount=${player.video().trackCount()} videoTrack=${player.video().track()} videoTracks=$videoTracks videoDimension=${dimension?.width ?: 0}x${dimension?.height ?: 0} audioTrackCount=${player.audio().trackCount()} subtitleTrackCount=${player.subpictures().trackCount()}",
+                    )
                     playbackStateMapper.onPlaying(playbackState.value)?.let {
                         playbackState.value = it
                     } ?: return
@@ -226,12 +318,20 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                 }
 
                 override fun paused(mediaPlayer: MediaPlayer) {
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "paused playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                    )
                     playbackStateMapper.onPaused(playbackState.value)?.let {
                         playbackState.value = it
                     }
                 }
 
                 override fun finished(mediaPlayer: MediaPlayer) {
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "finished playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                    )
                     if (playbackState.value <= PlaybackState.FINISHED) {
                         return
                     }
@@ -240,6 +340,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                 }
 
                 override fun stopped(mediaPlayer: MediaPlayer?) {
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "stopped playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                    )
                     if (playbackState.value <= PlaybackState.FINISHED) {
                         return
                     }
@@ -251,6 +355,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                     if (playbackState.value <= PlaybackState.FINISHED) {
                         return
                     }
+                    VlcRuntimeDiagnostics.error(
+                        tag = "VlcMediampPlayer",
+                        message = "vlcj player error playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                    )
                     logger.error { "vlcj player error" }
                     playbackStateMapper.reset()
                     playbackState.value = PlaybackState.ERROR
@@ -358,20 +466,22 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     override suspend fun setMediaDataImpl(data: MediaData): VlcjData = when (data) {
         is UriMediaData -> {
             playbackStateMapper.reset()
+            val lowerHeaders = data.headers.mapKeys { it.key.lowercase() }
+            val playbackOptions = buildPlaybackOptions(data)
+            VlcRuntimeDiagnostics.info(
+                tag = "VlcMediampPlayer",
+                message = "setMediaDataImpl(UriMediaData) playerId=${Integer.toHexString(System.identityHashCode(player))} uriHost=${runCatching { URI(data.uri).host }.getOrNull() ?: "<unknown>"} headers=${lowerHeaders.keys.joinToString()} options=${data.options.joinToString()} forcedOptions=${forcedSoftwareDecodeMediaOptions.joinToString()} playbackOptions=${playbackOptions.joinToString()} subtitles=${data.extraFiles.subtitles.size}",
+            )
             VlcjData(
                 data,
                 setPlay = {
-                    val lowerHeaders = data.headers.mapKeys { it.key.lowercase() }
+                    VlcRuntimeDiagnostics.info(
+                        tag = "VlcMediampPlayer",
+                        message = "media().play playerId=${Integer.toHexString(System.identityHashCode(player))} uriHost=${runCatching { URI(data.uri).host }.getOrNull() ?: "<unknown>"} playbackOptions=${playbackOptions.joinToString()}",
+                    )
                     player.media().play(
                         data.uri,
-                        *buildList {
-                            add("http-user-agent=${lowerHeaders["user-agent"] ?: "Mozilla/5.0"}")
-                            val referer = lowerHeaders["referer"]
-                            if (referer != null) {
-                                add("http-referrer=${referer}")
-                            }
-                            addAll(data.options)
-                        }.toTypedArray(),
+                        *playbackOptions,
                     )
                     lastMedia = null
                 },
@@ -383,6 +493,7 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
         is SeekableInputMediaData -> {
             playbackStateMapper.reset()
             val awaitContext = SupervisorJob(backgroundScope.coroutineContext[Job.Key])
+            val playbackOptions = buildPlaybackOptions(data)
             try {
                 val input = data.createInput(currentCoroutineContext())
 
@@ -391,9 +502,13 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
                     {
                         val new = SeekableInputCallbackMedia(input) { awaitContext.cancel() }
                         player.controls().stop()
+                        VlcRuntimeDiagnostics.info(
+                            tag = "VlcMediampPlayer",
+                            message = "media().play(SeekableInputMediaData) playerId=${Integer.toHexString(System.identityHashCode(player))} playbackOptions=${playbackOptions.joinToString()}",
+                        )
                         player.media().play(
                             new,
-                            *data.options.toTypedArray(),
+                            *playbackOptions,
                         )
                         lastMedia = new
                     },
@@ -421,6 +536,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     override fun resumeImpl() {
         when (val state = playbackState.value) {
             PlaybackState.READY -> {
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "resumeImpl from READY playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                )
                 openResource.value?.setPlay?.let { it() }
 
                 //        player.media().options().add(*arrayOf(":avcodec-hw=none")) // dxva2
@@ -429,6 +548,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
             }
 
             PlaybackState.PAUSED -> {
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "resumeImpl from PAUSED playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                )
                 player.submit {
                     player.controls().play()
                 }
@@ -476,12 +599,20 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     }
 
     override fun pauseImpl() {
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "pauseImpl playerId=${Integer.toHexString(System.identityHashCode(player))}",
+        )
         player.submit {
             player.controls().pause()
         }
     }
 
     override fun stopPlaybackImpl() {
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "stopPlaybackImpl playerId=${Integer.toHexString(System.identityHashCode(player))}",
+        )
         playbackStateMapper.reset()
         playbackState.value = PlaybackState.FINISHED
         currentPositionMillis.value = 0L
@@ -496,6 +627,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     }
 
     override fun closeImpl() {
+        VlcRuntimeDiagnostics.info(
+            tag = "VlcMediampPlayer",
+            message = "closeImpl playerId=${Integer.toHexString(System.identityHashCode(player))}",
+        )
         playbackStateMapper.reset()
         playbackState.value = PlaybackState.DESTROYED
         lastMedia?.onClose() // 在调用 VLC 之前停止阻塞线程
@@ -551,8 +686,20 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
 
         public fun prepareLibraries() {
             createPlayerLock.withLock {
-                NativeDiscovery().discover()
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "prepareLibraries discovery start nativeLog=${VlcRuntimeDiagnostics.nativeLogFile}",
+                )
+                val discovered = NativeDiscovery().discover()
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "prepareLibraries discovery result=$discovered",
+                )
                 CallbackMediaPlayerComponent().release()
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "prepareLibraries warmup callback component released",
+                )
             }
         }
 

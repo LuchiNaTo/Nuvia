@@ -11,48 +11,54 @@ package org.openani.mediamp.vlc
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.graphics.ImageBitmap
-import androidx.compose.ui.graphics.asComposeImageBitmap
+import androidx.compose.ui.graphics.toComposeImageBitmap
 import kotlinx.coroutines.flow.MutableStateFlow
-import org.jetbrains.skia.Bitmap
-import org.jetbrains.skia.ColorAlphaType
-import org.jetbrains.skia.ColorType
-import org.jetbrains.skia.ImageInfo
 import org.openani.mediamp.InternalMediampApi
 import org.openani.mediamp.vlc.SkiaBitmapVideoSurface.Companion.ALLOWED_DRAW_FRAMES
+import uk.co.caprica.vlcj.factory.MediaPlayerFactory
 import uk.co.caprica.vlcj.player.base.MediaPlayer
-import uk.co.caprica.vlcj.player.embedded.videosurface.CallbackVideoSurface
 import uk.co.caprica.vlcj.player.embedded.videosurface.VideoSurface
-import uk.co.caprica.vlcj.player.embedded.videosurface.VideoSurfaceAdapters
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormat
-import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormatCallback
-import uk.co.caprica.vlcj.player.embedded.videosurface.callback.RenderCallback
+import uk.co.caprica.vlcj.player.embedded.videosurface.callback.BufferFormatCallbackAdapter
+import uk.co.caprica.vlcj.player.embedded.videosurface.callback.RenderCallbackAdapter
 import uk.co.caprica.vlcj.player.embedded.videosurface.callback.format.RV32BufferFormat
+import java.awt.image.BufferedImage
+import java.awt.image.DataBufferInt
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater
-import javax.swing.SwingUtilities
 
 @InternalMediampApi
-public class SkiaBitmapVideoSurface : VideoSurface(VideoSurfaceAdapters.getVideoSurfaceAdapter()) {
-    private val videoSurface = SkiaVideoSurface()
-
-    @Volatile
-    private lateinit var imageInfo: ImageInfo
-
-    @Volatile
-    private lateinit var frameBytes: ByteArray
-    private val skiaBitmap: Bitmap = Bitmap()
+public class SkiaBitmapVideoSurface {
+    private val videoSurfaceMode: String = "BUFFERED_IMAGE_RENDER_CALLBACK_ADAPTER"
     private val composeBitmap = mutableStateOf<ImageBitmap?>(null)
 
     public val enableRendering: MutableStateFlow<Boolean> = MutableStateFlow(false)
 
     /**
-     * Set this to non-zero to draw frames even if [enableRendering] is true.
+     * Set this to non-zero to draw frames even if [enableRendering] is false.
      *
      * @see ALLOWED_DRAW_FRAMES
      */
     @JvmField
     @Volatile
     public var allowedDrawFrames: Int = 0
+
+    private val displayCount = AtomicInteger(0)
+    private var currentImage: BufferedImage? = null
+    private var currentRenderCallback: OfficialRenderCallback? = null
+
+    @Volatile
+    private var pitchBytes: Int = 0
+
+    @Volatile
+    private var lineCount: Int = 0
+
+    @Volatile
+    private var formatWidth: Int = 0
+
+    @Volatile
+    private var formatHeight: Int = 0
 
     public fun setAllowedDrawFrames(value: Int) {
         ALLOWED_DRAW_FRAMES.set(this, value)
@@ -61,66 +67,121 @@ public class SkiaBitmapVideoSurface : VideoSurface(VideoSurfaceAdapters.getVideo
     public val bitmap: ImageBitmap? by composeBitmap
 
     public fun clearBitmap() {
+        VlcRuntimeDiagnostics.info(
+            tag = "SkiaBitmapVideoSurface",
+            message = "clearBitmap",
+        )
         composeBitmap.value = null
     }
 
-    override fun attach(mediaPlayer: MediaPlayer) {
-        videoSurface.attach(mediaPlayer)
+    public fun createVideoSurface(mediaPlayerFactory: MediaPlayerFactory): VideoSurface {
+        val renderCallback = OfficialRenderCallback()
+        currentRenderCallback = renderCallback
+        val bufferFormatCallback = OfficialBufferFormatCallback(renderCallback)
+        val surface = mediaPlayerFactory.videoSurfaces().newVideoSurface(
+            bufferFormatCallback,
+            renderCallback,
+            true,
+        )
+        VlcRuntimeDiagnostics.info(
+            tag = "SkiaBitmapVideoSurface",
+            message = "createVideoSurface surfaceType=${surface::class.qualifiedName} bufferFormatCallback=${bufferFormatCallback::class.qualifiedName} renderCallback=${renderCallback::class.qualifiedName} videoSurfaceMode=$videoSurfaceMode BUFFERED_IMAGE_RENDER_CALLBACK_PATH_ENABLED",
+        )
+        return surface
     }
 
-    private inner class SkiaBitmapBufferFormatCallback : BufferFormatCallback {
-        private var sourceWidth: Int = 0
-        private var sourceHeight: Int = 0
+    private fun newVideoBuffer(width: Int, height: Int, pitch: Int, lines: Int) {
+        val image = BufferedImage(width, height, BufferedImage.TYPE_INT_RGB)
+        currentImage = image
+        formatWidth = width
+        formatHeight = height
+        pitchBytes = pitch
+        lineCount = lines
+        currentRenderCallback?.setImageBuffer(image)
+        VlcRuntimeDiagnostics.info(
+            tag = "SkiaBitmapVideoSurface",
+            message = "newVideoBuffer bitmap=${width}x${height} pitch=$pitch lines=$lines dataLength=${(image.raster.dataBuffer as DataBufferInt).data.size} videoSurfaceMode=$videoSurfaceMode",
+        )
+    }
 
+    private inner class OfficialBufferFormatCallback(
+        private val renderCallback: OfficialRenderCallback,
+    ) : BufferFormatCallbackAdapter() {
         override fun getBufferFormat(sourceWidth: Int, sourceHeight: Int): BufferFormat {
-            this.sourceWidth = sourceWidth
-            this.sourceHeight = sourceHeight
-            return RV32BufferFormat(sourceWidth, sourceHeight)
+            return try {
+                val bufferFormat = RV32BufferFormat(sourceWidth, sourceHeight)
+                val pitch = bufferFormat.pitches.firstOrNull() ?: (bufferFormat.width * 4)
+                val lines = bufferFormat.lines.firstOrNull() ?: bufferFormat.height
+                val bufferBytes = bufferFormat.pitches.zip(bufferFormat.lines)
+                    .sumOf { (currentPitch, currentLines) -> currentPitch.toLong() * currentLines.toLong() }
+                newVideoBuffer(bufferFormat.width, bufferFormat.height, pitch, lines)
+                VlcRuntimeDiagnostics.info(
+                    tag = "SkiaBitmapVideoSurface",
+                    message = "getBufferFormat width=$sourceWidth height=$sourceHeight returned=${bufferFormat::class.qualifiedName} chroma=${bufferFormat.chroma} pitches=${bufferFormat.pitches.joinToString()} lines=${bufferFormat.lines.joinToString()} planeCount=${bufferFormat.planeCount} bufferBytes=$bufferBytes videoSurfaceMode=$videoSurfaceMode",
+                )
+                bufferFormat
+            } catch (t: Throwable) {
+                VlcRuntimeDiagnostics.error(
+                    tag = "SkiaBitmapVideoSurface",
+                    message = "getBufferFormat failed width=$sourceWidth height=$sourceHeight",
+                    throwable = t,
+                )
+                throw t
+            }
         }
 
         override fun allocatedBuffers(buffers: Array<ByteBuffer>) {
-            frameBytes = buffers[0].run { ByteArray(remaining()).also(::get) }
-            imageInfo = ImageInfo(
-                sourceWidth,
-                sourceHeight,
-                ColorType.BGRA_8888,
-                ColorAlphaType.PREMUL,
+            val bufferBytes = buffers.sumOf { it.capacity().toLong() }
+            VlcRuntimeDiagnostics.info(
+                tag = "SkiaBitmapVideoSurface",
+                message = "allocatedBuffers count=${buffers.size} bufferBytes=$bufferBytes bitmap=${formatWidth}x${formatHeight} pitch=$pitchBytes lines=$lineCount renderCallback=${renderCallback::class.qualifiedName} videoSurfaceMode=$videoSurfaceMode",
             )
+            super.allocatedBuffers(buffers)
         }
     }
 
-    private inner class SkiaBitmapRenderCallback : RenderCallback {
-        override fun display(
-            mediaPlayer: MediaPlayer,
-            nativeBuffers: Array<ByteBuffer>,
-            bufferFormat: BufferFormat,
-        ) {
+    private inner class OfficialRenderCallback : RenderCallbackAdapter() {
+        fun setImageBuffer(image: BufferedImage) {
+            setBuffer((image.raster.dataBuffer as DataBufferInt).data)
+        }
+
+        override fun onDisplay(mediaPlayer: MediaPlayer, buffer: IntArray) {
+            val frameIndex = displayCount.incrementAndGet()
             val allowedDrawFramesValue = ALLOWED_DRAW_FRAMES.get(this@SkiaBitmapVideoSurface)
 
             if (!enableRendering.value) {
+                if (frameIndex <= 5 || frameIndex % 120 == 0) {
+                    VlcRuntimeDiagnostics.info(
+                        tag = "SkiaBitmapVideoSurface",
+                        message = "display frame=$frameIndex skipped enableRendering=false allowedDrawFrames=$allowedDrawFramesValue",
+                    )
+                }
                 if (allowedDrawFramesValue <= 0) {
                     return
                 }
-                if (ALLOWED_DRAW_FRAMES.decrementAndGet(this@SkiaBitmapVideoSurface) < 0) return
-            } else {
-                // 允许渲染, 不考虑 allowedDrawFrames
+                if (ALLOWED_DRAW_FRAMES.decrementAndGet(this@SkiaBitmapVideoSurface) < 0) {
+                    return
+                }
             }
 
-            SwingUtilities.invokeLater {
-                nativeBuffers[0].rewind()
-                nativeBuffers[0].get(frameBytes)
-                skiaBitmap.installPixels(imageInfo, frameBytes, bufferFormat.width * 4)
-                composeBitmap.value = skiaBitmap.asComposeImageBitmap()
+            val image = currentImage
+            if (image == null) {
+                VlcRuntimeDiagnostics.warn(
+                    tag = "SkiaBitmapVideoSurface",
+                    message = "display frame=$frameIndex skipped because currentImage is null",
+                )
+                return
+            }
+
+            composeBitmap.value = image.toComposeImageBitmap()
+            if (frameIndex <= 5 || frameIndex % 120 == 0) {
+                VlcRuntimeDiagnostics.info(
+                    tag = "SkiaBitmapVideoSurface",
+                    message = "display frame=$frameIndex image=${image.width}x${image.height} bufferInts=${buffer.size} composeBitmap=${composeBitmap.value?.width ?: 0}x${composeBitmap.value?.height ?: 0} videoSurfaceMode=$videoSurfaceMode",
+                )
             }
         }
     }
-
-    private inner class SkiaVideoSurface : CallbackVideoSurface(
-        SkiaBitmapBufferFormatCallback(),
-        SkiaBitmapRenderCallback(),
-        true,
-        videoSurfaceAdapter,
-    )
 
     private companion object {
         private val ALLOWED_DRAW_FRAMES = AtomicIntegerFieldUpdater.newUpdater(
