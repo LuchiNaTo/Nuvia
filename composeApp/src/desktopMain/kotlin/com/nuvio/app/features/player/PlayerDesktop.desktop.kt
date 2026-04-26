@@ -2995,6 +2995,29 @@ actual val requiresExternalPlayerControls: Boolean
 actual val usesNativePlayerOverlay: Boolean
     get() = !isMacOS && resolveWindowsDesktopBackend().backend == WindowsDesktopBackend.VLC
 
+private object Win32Window {
+    const val GWL_EXSTYLE = -20
+    const val WS_EX_TOOLWINDOW = 0x00000080
+    const val WS_EX_APPWINDOW = 0x00040000
+
+    private interface User32 : com.sun.jna.Library {
+        fun GetWindowLongPtr(hWnd: Pointer?, nIndex: Int): Long
+        fun SetWindowLongPtr(hWnd: Pointer?, nIndex: Int, dwNewLong: Long): Long
+    }
+
+    val user32: User32? = runCatching { Native.load("user32", User32::class.java) as User32 }.getOrNull()
+
+    fun applyToolWindowStyle(hwnd: Pointer?) {
+        val u = user32 ?: return
+        if (hwnd == null) return
+        runCatching {
+            val current = u.GetWindowLongPtr(hwnd, GWL_EXSTYLE)
+            val newStyle = (current or WS_EX_TOOLWINDOW.toLong()) and WS_EX_APPWINDOW.toLong().inv()
+            u.SetWindowLongPtr(hwnd, GWL_EXSTYLE, newStyle)
+        }
+    }
+}
+
 /**
  * Native overlay implementation for Windows VLC.
  *
@@ -3129,14 +3152,27 @@ actual fun NativePlayerOverlay(
         androidx.compose.ui.unit.DpSize(size.width.toDp(), size.height.toDp())
     }
 
+    val awtWindowRef = remember { java.util.concurrent.atomic.AtomicReference<java.awt.Window?>(null) }
+
     val overlayState = androidx.compose.ui.window.rememberWindowState(
         position = overlayPosition,
         size = overlaySize,
     )
 
+    // Update the actual AWT Window bounds in pixel coordinates when the tracked
+    // position/size change. This avoids DPI/rounding artefacts from Dp conversions
+    // and keeps the overlay tightly synced with the VLC container.
     LaunchedEffect(pos, size) {
-        overlayState.position = overlayPosition
-        overlayState.size = overlaySize
+        val awtWindow = awtWindowRef.get()
+        if (awtWindow != null) {
+            javax.swing.SwingUtilities.invokeLater {
+                runCatching {
+                    awtWindow.setBounds(pos.x, pos.y, size.width.coerceAtLeast(1), size.height.coerceAtLeast(1))
+                }.onFailure {
+                    DesktopRuntimeDiagnostics.warn("PlayerDesktop", "Failed to set overlay bounds", it)
+                }
+            }
+        }
     }
 
     androidx.compose.ui.window.Window(
@@ -3150,9 +3186,14 @@ actual fun NativePlayerOverlay(
         alwaysOnTop = false,
     ) {
         DisposableEffect(window) {
+            // Keep a reference to the underlying AWT window so we can set pixel bounds
+            // from outside the composition and apply native Win32 tweaks.
+            awtWindowRef.set(window)
+
             // Hide the helper window from the taskbar / alt-tab on systems that honour
             // Window.Type. (Windows partially respects this — fine to call defensively.)
             runCatching { window.type = java.awt.Window.Type.UTILITY }
+
             // Make sure no stray opaque background bleeds through Skia's transparent layer.
             runCatching {
                 window.background = java.awt.Color(0, 0, 0, 0)
@@ -3161,7 +3202,18 @@ actual fun NativePlayerOverlay(
                     it.background = java.awt.Color(0, 0, 0, 0)
                 }
             }
-            onDispose {}
+
+            // Apply lightweight Win32 toolwindow style to avoid taskbar/Alt-Tab entry.
+            if (!isMacOS) {
+                runCatching {
+                    val hwndPtr = Native.getComponentPointer(window)
+                    Win32Window.applyToolWindowStyle(hwndPtr)
+                }.onFailure {
+                    DesktopRuntimeDiagnostics.warn("PlayerDesktop", "Failed to apply Win32 toolwindow style", it)
+                }
+            }
+
+            onDispose { awtWindowRef.set(null) }
         }
         NuvioTheme(
             appTheme = appThemeState.value,
