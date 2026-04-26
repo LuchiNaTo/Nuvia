@@ -1004,10 +1004,12 @@ private fun WindowsVlcPlayerSurface(
         )
     }
 
-    LaunchedEffect(controller) {
+    // Ensure the host receives onControllerReady not only on controller creation
+    // but also when the active media request changes (reloads, subtitle changes, etc.).
+    LaunchedEffect(controller, mediaRequest) {
         DesktopRuntimeDiagnostics.info(
             tag = "PlayerDesktop",
-            message = "VLC controller bound to playerId=$playerInstanceId controllerId=${Integer.toHexString(System.identityHashCode(controller))}",
+            message = "VLC controller bound/rebound to playerId=$playerInstanceId controllerId=${Integer.toHexString(System.identityHashCode(controller))} reloadNonce=${mediaRequest.reloadNonce}",
         )
         currentOnControllerReady(controller)
     }

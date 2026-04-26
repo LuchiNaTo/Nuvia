@@ -209,6 +209,7 @@ fun PlayerScreen(
         var playbackSnapshot by remember { mutableStateOf(PlayerPlaybackSnapshot()) }
         var playerController by remember { mutableStateOf<PlayerEngineController?>(null) }
         var playerControllerSourceUrl by remember { mutableStateOf<String?>(null) }
+        var activeMediaGeneration by remember { mutableStateOf(0) }
         var errorMessage by remember { mutableStateOf<String?>(null) }
         var scrubbingPositionMs by remember { mutableStateOf<Long?>(null) }
         var pausedOverlayVisible by remember { mutableStateOf(false) }
@@ -655,6 +656,7 @@ fun PlayerScreen(
         }
 
         fun seekBy(offsetMs: Long) {
+            playerLog.d { "seekBy called offset=$offsetMs controllerPresent=${playerController != null} generation=$activeMediaGeneration" }
             playerController?.seekBy(offsetMs)
             controlsVisible = true
             when {
@@ -687,6 +689,7 @@ fun PlayerScreen(
                     maxDurationMs?.let { unclamped.coerceAtMost(it) } ?: unclamped
                 }
             }
+            playerLog.d { "doubleTapSeek direction=$direction target=$targetPositionMs controllerPresent=${playerController != null} generation=$activeMediaGeneration" }
             playerController?.seekTo(targetPositionMs)
             controlsVisible = true
             showSeekFeedback(direction, nextState.amountMs)
@@ -817,6 +820,7 @@ fun PlayerScreen(
                     bingeGroup = stream.behaviorHints.bingeGroup,
                 )
             }
+            playerLog.i { "switchToSource requested url=${url.take(64)} generation=${activeMediaGeneration + 1}" }
             activeSourceUrl = url
             activeSourceAudioUrl = null
             activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -877,6 +881,7 @@ fun PlayerScreen(
                     bingeGroup = stream.behaviorHints.bingeGroup,
                 )
             }
+            playerLog.i { "switchToEpisodeStream requested url=${url.take(64)} generation=${activeMediaGeneration + 1} episode=${episode.id}" }
             activeSourceUrl = url
             activeSourceAudioUrl = null
             activeSourceHeaders = sanitizePlaybackHeaders(stream.behaviorHints.proxyHeaders?.request)
@@ -1103,6 +1108,8 @@ fun PlayerScreen(
 
         LaunchedEffect(activeSourceUrl, activeSourceAudioUrl, activeSourceHeaders, activeSourceResponseHeaders) {
             errorMessage = null
+            // Bump media generation so we can ignore stale callbacks/events from previous media
+            activeMediaGeneration += 1
             playerController = null
             playerControllerSourceUrl = null
             playbackSnapshot = PlayerPlaybackSnapshot()
@@ -1422,6 +1429,13 @@ fun PlayerScreen(
         // Auto-play on video ended if next episode card isn't already showing
         LaunchedEffect(playbackSnapshot.isEnded, nextEpisodeInfo) {
             if (playbackSnapshot.isEnded && nextEpisodeInfo != null && !showNextEpisodeCard) {
+                // Guard against ended/completed events from an obsolete player during media switches.
+                // Only handle ended when the controller is bound to the current source and initial load completed.
+                if (playerControllerSourceUrl != activeSourceUrl || !initialLoadCompleted) {
+                    playerLog.i { "Ignoring ended event - obsolete or still loading: controllerSource=$playerControllerSourceUrl activeSource=$activeSourceUrl initialLoad=$initialLoadCompleted" }
+                    return@LaunchedEffect
+                }
+
                 showNextEpisodeCard = true
                 if (playerSettingsUiState.streamAutoPlayNextEpisodeEnabled && nextEpisodeInfo?.hasAired == true) {
                     playNextEpisode()
@@ -1459,6 +1473,7 @@ fun PlayerScreen(
                 playWhenReady = shouldPlay,
                 resizeMode = resizeMode,
                 onControllerReady = { controller ->
+                    playerLog.i { "onControllerReady - assigning controller for source=$activeSourceUrl generation=$activeMediaGeneration" }
                     playerController = controller
                     playerControllerSourceUrl = activeSourceUrl
                     controller.setMetadata(
@@ -2034,6 +2049,7 @@ fun PlayerScreen(
                 selectedIndex = selectedAudioIndex,
                 onTrackSelected = { index ->
                     selectedAudioIndex = index
+                    playerLog.d { "selectAudioTrack index=$index controllerPresent=${playerController != null} generation=$activeMediaGeneration" }
                     playerController?.selectAudioTrack(index)
                     scope.launch {
                         delay(200)
@@ -2058,6 +2074,7 @@ fun PlayerScreen(
                     selectedSubtitleIndex = index
                     selectedAddonSubtitleId = null
                     useCustomSubtitles = false
+                    playerLog.d { "selectBuiltInSubtitle index=$index wasCustom=$wasCustom controllerPresent=${playerController != null} generation=$activeMediaGeneration" }
                     if (wasCustom) {
                         playerController?.clearExternalSubtitleAndSelect(index)
                     } else {
@@ -2068,6 +2085,7 @@ fun PlayerScreen(
                     selectedAddonSubtitleId = addon.id
                     selectedSubtitleIndex = -1
                     useCustomSubtitles = true
+                    playerLog.d { "selectAddonSubtitle id=${addon.id} url=${addon.url.take(64)} controllerPresent=${playerController != null} generation=$activeMediaGeneration" }
                     playerController?.setSubtitleUri(addon.url)
                 },
                 onFetchAddonSubtitles = ::fetchAddonSubtitlesForActiveItem,
