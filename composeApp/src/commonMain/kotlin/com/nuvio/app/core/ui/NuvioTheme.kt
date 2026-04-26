@@ -27,6 +27,8 @@ import org.jetbrains.compose.resources.Font
 
 val LocalAppTheme = staticCompositionLocalOf { AppTheme.WHITE }
 
+val LocalAmoledEnabled = staticCompositionLocalOf { false }
+
 val MaterialTheme.appTheme: AppTheme
     @Composable
     @ReadOnlyComposable
@@ -222,6 +224,7 @@ fun NuvioTheme(
         LocalNuvioTypeScale provides NuvioTypeTokens,
         LocalRippleConfiguration provides NuvioRippleConfiguration,
         LocalAppTheme provides appTheme,
+        LocalAmoledEnabled provides amoled,
     ) {
         MaterialTheme(
             colorScheme = colorScheme,

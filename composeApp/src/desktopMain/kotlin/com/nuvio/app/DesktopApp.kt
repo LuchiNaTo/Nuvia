@@ -16,19 +16,29 @@ private fun configureMacOsNativeAppearance() {
     System.setProperty("apple.awt.application.appearance", "NSAppearanceNameDarkAqua")
 }
 
+@Volatile
+private var composeInteropBlendingSource: String = "non-windows-unchanged"
+
 private fun configureWindowsComposeInterop() {
     val osName = System.getProperty("os.name")?.lowercase() ?: return
     if (!osName.contains("windows")) return
-    if (System.getProperty("compose.interop.blending").isNullOrBlank()) {
-        System.setProperty("compose.interop.blending", "true")
-    // val explicitInteropOverride = System.getProperty("nuvio.compose.interop.blending")
-    //     ?: System.getenv("NUVIO_COMPOSE_INTEROP_BLENDING")
-    // if (!explicitInteropOverride.isNullOrBlank()) {
-    //     System.setProperty("compose.interop.blending", explicitInteropOverride)
+
+    val explicitJvm = System.getProperty("compose.interop.blending")
+    val nuvioOverride = System.getProperty("nuvio.compose.interop.blending")
+        ?: System.getenv("NUVIO_COMPOSE_INTEROP_BLENDING")
+
+    composeInteropBlendingSource = when {
+        !explicitJvm.isNullOrBlank() -> "jvm-property"
+        !nuvioOverride.isNullOrBlank() -> {
+            System.setProperty("compose.interop.blending", nuvioOverride)
+            "nuvio-override"
+        }
+        else -> "default-windows-unset"
     }
 }
 
 private fun configureDesktopRuntimeEnvironment() {
+    System.setProperty("sun.awt.noerasebackground", "true")
     configureWindowsComposeInterop()
     DesktopRuntimeDiagnostics.initialize()
     System.setProperty("mediamp.cache.dir", DesktopPaths.cacheRoot.toString())
@@ -38,7 +48,8 @@ private fun configureDesktopRuntimeEnvironment() {
     )
     DesktopRuntimeDiagnostics.info(
         tag = "DesktopApp",
-        message = "compose.interop.blending=${System.getProperty("compose.interop.blending") ?: "<unset>"}, " +
+        message = "compose.interop.blending effective=${System.getProperty("compose.interop.blending") ?: "<unset>"} " +
+            "source=$composeInteropBlendingSource, " +
             "requestedSkikoRenderApi=${System.getProperty("skiko.renderApi") ?: "<default>"}",
     )
     DesktopRuntimeDiagnostics.logStartupConfiguration()

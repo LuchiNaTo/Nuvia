@@ -1,6 +1,7 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.IntSize
 
 interface PlayerGestureController {
@@ -33,3 +34,14 @@ expect fun rememberPlayerGestureController(): PlayerGestureController?
 expect val usesNativePlayerChrome: Boolean
 
 expect val usesAnimatedPlayerChrome: Boolean
+
+expect val requiresExternalPlayerControls: Boolean
+
+expect val usesNativePlayerOverlay: Boolean
+
+@Composable
+expect fun NativePlayerOverlay(
+    modifier: Modifier = Modifier,
+    visible: Boolean = true,
+    content: @Composable () -> Unit
+)

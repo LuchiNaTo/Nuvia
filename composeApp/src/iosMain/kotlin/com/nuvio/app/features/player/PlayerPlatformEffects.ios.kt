@@ -65,6 +65,23 @@ actual val usesNativePlayerChrome: Boolean = false
 
 actual val usesAnimatedPlayerChrome: Boolean = true
 
+actual val requiresExternalPlayerControls: Boolean = false
+
+actual val usesNativePlayerOverlay: Boolean = false
+
+@Composable
+actual fun NativePlayerOverlay(
+    modifier: Modifier,
+    visible: Boolean,
+    content: @Composable () -> Unit
+) {
+    if (visible) {
+        androidx.compose.foundation.layout.Box(modifier = modifier) {
+            content()
+        }
+    }
+}
+
 private class IOSPlayerGestureController : PlayerGestureController {
     private val volumeView = MPVolumeView().apply {
         hidden = true

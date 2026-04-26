@@ -2,7 +2,9 @@ package com.nuvio.app.features.player
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.size
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -13,12 +15,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.awt.SwingPanel
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import com.nuvio.app.LocalDesktopWindow
 import com.nuvio.app.core.storage.ProfileScopedKey
 import com.nuvio.app.core.sync.decodeSyncBoolean
@@ -43,11 +50,20 @@ import java.awt.BorderLayout
 import java.awt.Canvas
 import java.awt.Component
 import java.awt.Panel
+import java.awt.event.ComponentAdapter
+import java.awt.event.ComponentEvent
 import java.net.HttpURLConnection
 import java.net.URI
 import java.util.Locale
+import javax.swing.JLayeredPane
 import javax.swing.JPanel
+import javax.swing.SwingUtilities
 import kotlinx.coroutines.CancellationException
+import com.nuvio.app.core.ui.LocalAmoledEnabled
+import com.nuvio.app.core.ui.LocalAppTheme
+import com.nuvio.app.core.ui.NuvioTheme
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.runtime.CompositionLocalProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
@@ -124,6 +140,8 @@ private fun resolveWindowsDesktopBackend(): ResolvedWindowsDesktopBackend {
         }
     }
 }
+
+val activeVlcOverlayContainerState = mutableStateOf<JLayeredPane?>(null)
 
 @Composable
 actual fun PlatformPlayerSurface(
@@ -696,6 +714,8 @@ private fun createWindowsVlcMediaRequest(
     reloadNonce = reloadNonce,
 )
 
+val activeVlcOverlayContainerState = mutableStateOf<JLayeredPane?>(null)
+
 @OptIn(InternalMediampApi::class)
 @Composable
 private fun WindowsVlcPlayerSurface(
@@ -730,6 +750,7 @@ private fun WindowsVlcPlayerSurface(
     val renderSurface = remember {
         Canvas().apply {
             background = java.awt.Color.BLACK
+            foreground = java.awt.Color.BLACK
             isFocusable = false
             ignoreRepaint = true
         }
@@ -737,8 +758,32 @@ private fun WindowsVlcPlayerSurface(
     val renderHost = remember(renderSurface) {
         JPanel(BorderLayout()).apply {
             background = java.awt.Color.BLACK
+            foreground = java.awt.Color.BLACK
             isOpaque = true
             add(renderSurface, BorderLayout.CENTER)
+        }
+    }
+
+    val layeredPane = remember {
+        object : JLayeredPane() {
+            override fun doLayout() {
+                super.doLayout()
+                renderHost.setBounds(0, 0, width, height)
+            }
+        }.apply {
+            isOpaque = false
+            layout = null
+        }
+    }
+
+    DisposableEffect(layeredPane) {
+        DesktopRuntimeDiagnostics.info("PlayerDesktop", "WindowsVlcPlayerSurface: Initializing JLayeredPane")
+        layeredPane.add(renderHost, java.lang.Integer(0)) // DEFAULT_LAYER
+        activeVlcOverlayContainerState.value = layeredPane
+        onDispose {
+            DesktopRuntimeDiagnostics.info("PlayerDesktop", "WindowsVlcPlayerSurface: Disposing JLayeredPane")
+            activeVlcOverlayContainerState.value = null
+            layeredPane.remove(renderHost)
         }
     }
 
@@ -1005,7 +1050,7 @@ private fun WindowsVlcPlayerSurface(
     }
 
     SwingPanel(
-        factory = { renderHost },
+        factory = { layeredPane },
         modifier = modifier
             .background(Color.Black)
             .onGloballyPositioned { coordinates ->
@@ -1019,8 +1064,9 @@ private fun WindowsVlcPlayerSurface(
                 }
             },
         update = { host ->
-            host.background = java.awt.Color.BLACK
-            renderHost.background = java.awt.Color.BLACK
+            host.isOpaque = false
+            layeredPane.isOpaque = false
+            renderHost.isOpaque = true
             renderSurface.background = java.awt.Color.BLACK
             host.revalidate()
         },
@@ -1155,7 +1201,7 @@ private fun WindowsMpvPlayerSurface(
             )
         } catch (e: Throwable) {
             if (e is CancellationException) throw e
-            reportFatalFailure("pre-initialize render-surface attach", e)
+            reportFatalFailure("pre-initialize_render-surface_attach", e)
         }
     }
 
@@ -2939,3 +2985,80 @@ actual val usesNativePlayerChrome: Boolean
     get() = isMacOS
 
 actual val usesAnimatedPlayerChrome: Boolean = false
+
+actual val requiresExternalPlayerControls: Boolean
+    get() = !isMacOS && resolveWindowsDesktopBackend().backend == WindowsDesktopBackend.VLC
+
+actual val usesNativePlayerOverlay: Boolean
+    get() = !isMacOS && resolveWindowsDesktopBackend().backend == WindowsDesktopBackend.VLC
+
+@Composable
+actual fun NativePlayerOverlay(
+    modifier: Modifier,
+    visible: Boolean,
+    content: @Composable () -> Unit
+) {
+    if (!usesNativePlayerOverlay) {
+        if (visible) {
+            androidx.compose.foundation.layout.Box(modifier = modifier) {
+                content()
+            }
+        }
+        return
+    }
+
+    val container = activeVlcOverlayContainerState.value
+    
+    // Capture theme locals from the main composition
+    val appTheme = LocalAppTheme.current
+    val amoled = LocalAmoledEnabled.current
+    val darkTheme = isSystemInDarkTheme()
+
+    // Placeholder Box to maintain layout
+    androidx.compose.foundation.layout.Box(modifier = modifier)
+
+    if (visible && container != null) {
+        DisposableEffect(container, appTheme, amoled, darkTheme) {
+            DesktopRuntimeDiagnostics.info("NativePlayerOverlay", "NativePlayerOverlay: Creating ComposePanel overlay")
+            
+            val composePanel = androidx.compose.ui.awt.ComposePanel().apply {
+                isOpaque = false
+                background = java.awt.Color(0, 0, 0, 0)
+                setContent {
+                    // Inject the theme into the new composition to avoid white backgrounds
+                    NuvioTheme(appTheme = appTheme, amoled = amoled, darkTheme = darkTheme) {
+                        content()
+                    }
+                }
+            }
+
+            // Use Integer objects for JLayeredPane constraints to ensure correct layering
+            container.add(composePanel, java.lang.Integer(100)) // PALETTE_LAYER
+
+            fun updateBounds() {
+                if (composePanel.width != container.width || composePanel.height != container.height) {
+                    composePanel.setBounds(0, 0, container.width, container.height)
+                    DesktopRuntimeDiagnostics.info("NativePlayerOverlay", "NativePlayerOverlay: bounds updated to ${container.width}x${container.height}")
+                    container.revalidate()
+                    container.repaint()
+                }
+            }
+
+            val listener = object : ComponentAdapter() {
+                override fun componentResized(e: ComponentEvent) = updateBounds()
+                override fun componentMoved(e: ComponentEvent) = updateBounds()
+            }
+
+            container.addComponentListener(listener)
+            updateBounds()
+
+            onDispose {
+                DesktopRuntimeDiagnostics.info("NativePlayerOverlay", "NativePlayerOverlay: Disposing overlay")
+                container.removeComponentListener(listener)
+                container.remove(composePanel)
+                container.revalidate()
+                container.repaint()
+            }
+        }
+    }
+}

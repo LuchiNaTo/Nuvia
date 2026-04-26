@@ -9,13 +9,17 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContent
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -298,6 +302,9 @@ fun PlayerScreen(
             isPlaying = playbackSnapshot.isPlaying,
             playerSize = layoutSize,
         )
+
+        val requiresExternalControls = requiresExternalPlayerControls
+        val usesNativeOverlay = usesNativePlayerOverlay
 
         val playbackSession = remember(
             contentType,
@@ -1437,12 +1444,16 @@ fun PlayerScreen(
                 .fillMaxSize()
                 .onSizeChanged { layoutSize = it },
         ) {
+            val surfaceModifier = if (requiresExternalControls && !usesNativeOverlay)
+                Modifier.fillMaxWidth().height(maxHeight - externalBottomHeight).align(Alignment.TopCenter)
+            else Modifier.fillMaxSize()
+
             PlatformPlayerSurface(
                 sourceUrl = activeSourceUrl,
                 sourceAudioUrl = activeSourceAudioUrl,
                 sourceHeaders = activeSourceHeaders,
                 sourceResponseHeaders = activeSourceResponseHeaders,
-                modifier = Modifier.fillMaxSize(),
+                modifier = surfaceModifier,
                 playWhenReady = shouldPlay,
                 resizeMode = resizeMode,
                 onControllerReady = { controller ->
@@ -1603,10 +1614,26 @@ fun PlayerScreen(
                 },
             )
 
-            Box(
-                modifier = Modifier
-                    .matchParentSize()
-                    .pointerInput(layoutSize) {
+            val controlsContainerModifier = if (requiresExternalControls && !usesNativeOverlay)
+                Modifier.fillMaxWidth().height(externalBottomHeight).align(Alignment.BottomCenter).background(Color.Black)
+            else Modifier.fillMaxSize()
+
+            val nativeOverlayModifier = if (usesNativeOverlay)
+                Modifier.size(
+                    with(LocalDensity.current) { layoutSize.width.toDp() },
+                    with(LocalDensity.current) { layoutSize.height.toDp() }
+                )
+            else Modifier.fillMaxSize()
+
+            NativePlayerOverlay(
+                modifier = nativeOverlayModifier,
+                visible = true
+            ) {
+                Box(modifier = controlsContainerModifier) {
+                    if (!requiresExternalControls || usesNativeOverlay) Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .pointerInput(layoutSize) {
                         awaitPointerEventScope {
                             var lastRevealUptime = 0L
                             while (true) {
