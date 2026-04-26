@@ -88,17 +88,26 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     MediampPlayer,
     AbstractMediampPlayer<VlcjData>(Dispatchers.Default) {
 
-    private val vlcFactoryArgs = arrayOf(
-        "--avcodec-hw=none",
-        "--no-snapshot-preview",
-        "--intf=dummy",
-        "--file-logging",
-        "--logfile=${VlcRuntimeDiagnostics.nativeLogFile}",
-        "--verbose=2",
-    )
+    private val isWindowsHost: Boolean =
+        System.getProperty("os.name")?.contains("Windows", ignoreCase = true) == true
+
+    private val preferredEmbeddedVout: String? =
+        if (isWindowsHost) "wingdi" else null
+
+    private val vlcFactoryArgs = buildList {
+        add("--avcodec-hw=none")
+        preferredEmbeddedVout?.let { add("--vout=$it") }
+        add("--no-snapshot-preview")
+        add("--intf=dummy")
+        add("--file-logging")
+        add("--logfile=${VlcRuntimeDiagnostics.nativeLogFile}")
+        add("--verbose=2")
+    }.toTypedArray()
 
     private val forcedSoftwareDecodeMediaOptions = listOf(
         ":avcodec-hw=none",
+    ) + listOfNotNull(
+        preferredEmbeddedVout?.let { ":vout=$it" },
     )
 
     private val backgroundScope: CoroutineScope = CoroutineScope(
