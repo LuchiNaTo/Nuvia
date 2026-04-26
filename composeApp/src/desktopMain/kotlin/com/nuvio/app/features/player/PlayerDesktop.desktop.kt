@@ -2984,12 +2984,52 @@ actual val usesNativePlayerChrome: Boolean
 
 actual val usesAnimatedPlayerChrome: Boolean = false
 
+// Disable the "split layout" branch in PlayerScreen — with the JWindow-based native overlay
+// below, the video Canvas can stay fullscreen and chrome composables float above it as a
+// real overlay, just like on Android/iOS.
 actual val requiresExternalPlayerControls: Boolean
-    get() = !isMacOS && resolveWindowsDesktopBackend().backend == WindowsDesktopBackend.VLC
+    get() = false
 
+// Enable the JWindow-based native overlay for Windows VLC. macOS keeps its system chrome,
+// Windows MPV / Native bridge backends run their own UI path.
 actual val usesNativePlayerOverlay: Boolean
     get() = !isMacOS && resolveWindowsDesktopBackend().backend == WindowsDesktopBackend.VLC
 
+/**
+ * Native overlay implementation for Windows VLC.
+ *
+ * Architecture: a sibling top-level transparent Compose window slaved to the VLC container's
+ * on-screen rectangle.
+ *
+ * Why a separate Compose [androidx.compose.ui.window.Window] instead of an embedded
+ * [androidx.compose.ui.awt.ComposePanel]:
+ *  - VLC's video output is a heavyweight AWT Canvas painted directly into its native HWND
+ *    (Direct3D11/wingdi). On Windows, heavyweight peers win the z-order race against any
+ *    lightweight Swing/Compose sibling inside the same JLayeredPane, so a ComposePanel
+ *    sibling is invisible.
+ *  - A bare [javax.swing.JWindow] hosting a ComposePanel does z-order correctly above the
+ *    Canvas, but the embedded SkiaLayer used by ComposePanel is opaque by default — the
+ *    overlay paints solid black on top of the video. There is no public API to flip the
+ *    SkiaLayer to transparent.
+ *  - The supported way to opt into per-pixel translucency in Compose Desktop is
+ *    `Window(transparent = true)`. That call configures the underlying Skiko layer for
+ *    transparent compositing AND configures the AWT window for alpha. We piggy-back on it
+ *    to host the chrome.
+ *
+ * Implementation notes:
+ *  - Bounds: we mirror the VLC container's `locationOnScreen` / `width` / `height` into a
+ *    [androidx.compose.ui.window.WindowState] using the parent composition's [Density] so
+ *    the overlay tracks the video region across move/resize/iconify of the main window.
+ *  - Theming/content: Compose [androidx.compose.ui.window.Window] starts a brand-new
+ *    composition with no inherited CompositionLocals, so we re-apply [NuvioTheme] inside.
+ *  - Click handling: the chrome's own gesture handlers cover the whole overlay; we never
+ *    want click-through, we just want the events to land on PlayerScreen's pointerInput
+ *    block. When [visible]==false we omit the Window entirely so input falls back to the
+ *    main app.
+ *  - Taskbar: we set `window.type = UTILITY` post-creation. On Windows that hides the
+ *    overlay from Alt+Tab and (depending on shell) the taskbar. If a stray entry shows up
+ *    we can layer a JNA `WS_EX_TOOLWINDOW` patch on top later — kept minimal for now.
+ */
 @Composable
 actual fun NativePlayerOverlay(
     modifier: Modifier,
@@ -3005,58 +3045,130 @@ actual fun NativePlayerOverlay(
         return
     }
 
+    val mainWindow = LocalDesktopWindow.current
     val container = activeVlcOverlayContainerState.value
-    
-    // Capture theme locals from the main composition
+
     val appTheme = LocalAppTheme.current
     val amoled = LocalAmoledEnabled.current
     val darkTheme = isSystemInDarkTheme()
+    val appThemeState = rememberUpdatedState(appTheme)
+    val amoledState = rememberUpdatedState(amoled)
+    val darkThemeState = rememberUpdatedState(darkTheme)
+    val contentState = rememberUpdatedState(content)
 
-    // Placeholder Box to maintain layout
+    // Placeholder so the parent layout still reserves the same slot as the previous designs.
     androidx.compose.foundation.layout.Box(modifier = modifier)
 
-    if (visible && container != null) {
-        DisposableEffect(container, appTheme, amoled, darkTheme) {
-            DesktopRuntimeDiagnostics.info("NativePlayerOverlay", "NativePlayerOverlay: Creating ComposePanel overlay")
-            
-            val composePanel = androidx.compose.ui.awt.ComposePanel().apply {
-                isOpaque = false
-                background = java.awt.Color(0, 0, 0, 0)
-                setContent {
-                    // Inject the theme into the new composition to avoid white backgrounds
-                    NuvioTheme(appTheme = appTheme, amoled = amoled, darkTheme = darkTheme) {
-                        content()
-                    }
+    if (!visible || mainWindow == null || container == null) return
+
+    val parentDensity = LocalDensity.current
+
+    // (x, y) in user-space px (Java's HiDPI-aware coordinates) of the VLC AWT container.
+    var trackedPosition by remember { mutableStateOf<IntOffset?>(null) }
+    var trackedSize by remember { mutableStateOf<IntSize?>(null) }
+
+    DisposableEffect(mainWindow, container) {
+        fun refresh() {
+            if (!container.isShowing || !mainWindow.isShowing) {
+                trackedPosition = null
+                trackedSize = null
+                return
+            }
+            val w = container.width
+            val h = container.height
+            if (w <= 0 || h <= 0) return
+            val onScreen = try {
+                container.locationOnScreen
+            } catch (_: java.awt.IllegalComponentStateException) {
+                return
+            }
+            trackedPosition = IntOffset(onScreen.x, onScreen.y)
+            trackedSize = IntSize(w, h)
+        }
+
+        val componentListener = object : ComponentAdapter() {
+            override fun componentResized(e: ComponentEvent) = refresh()
+            override fun componentMoved(e: ComponentEvent) = refresh()
+            override fun componentShown(e: ComponentEvent) = refresh()
+            override fun componentHidden(e: ComponentEvent) {
+                trackedPosition = null
+                trackedSize = null
+            }
+        }
+        val mainFrame = mainWindow as? java.awt.Frame
+        val windowAdapter = object : java.awt.event.WindowAdapter() {
+            override fun windowIconified(e: java.awt.event.WindowEvent?) {
+                trackedPosition = null
+                trackedSize = null
+            }
+            override fun windowDeiconified(e: java.awt.event.WindowEvent?) = refresh()
+            override fun windowActivated(e: java.awt.event.WindowEvent?) = refresh()
+        }
+
+        container.addComponentListener(componentListener)
+        mainWindow.addComponentListener(componentListener)
+        mainFrame?.addWindowListener(windowAdapter)
+        mainFrame?.addWindowStateListener(windowAdapter)
+        javax.swing.SwingUtilities.invokeLater { refresh() }
+
+        onDispose {
+            container.removeComponentListener(componentListener)
+            mainWindow.removeComponentListener(componentListener)
+            mainFrame?.removeWindowListener(windowAdapter)
+            mainFrame?.removeWindowStateListener(windowAdapter)
+        }
+    }
+
+    val pos = trackedPosition ?: return
+    val size = trackedSize ?: return
+
+    val overlayPosition = with(parentDensity) {
+        androidx.compose.ui.window.WindowPosition(pos.x.toDp(), pos.y.toDp())
+    }
+    val overlaySize = with(parentDensity) {
+        androidx.compose.ui.unit.DpSize(size.width.toDp(), size.height.toDp())
+    }
+
+    val overlayState = androidx.compose.ui.window.rememberWindowState(
+        position = overlayPosition,
+        size = overlaySize,
+    )
+
+    LaunchedEffect(pos, size) {
+        overlayState.position = overlayPosition
+        overlayState.size = overlaySize
+    }
+
+    androidx.compose.ui.window.Window(
+        onCloseRequest = {},
+        state = overlayState,
+        title = "",
+        transparent = true,
+        undecorated = true,
+        resizable = false,
+        focusable = true,
+        alwaysOnTop = false,
+    ) {
+        DisposableEffect(window) {
+            // Hide the helper window from the taskbar / alt-tab on systems that honour
+            // Window.Type. (Windows partially respects this — fine to call defensively.)
+            runCatching { window.type = java.awt.Window.Type.UTILITY }
+            // Make sure no stray opaque background bleeds through Skia's transparent layer.
+            runCatching {
+                window.background = java.awt.Color(0, 0, 0, 0)
+                (window.contentPane as? javax.swing.JComponent)?.let {
+                    it.isOpaque = false
+                    it.background = java.awt.Color(0, 0, 0, 0)
                 }
             }
-
-            // Use Integer objects for JLayeredPane constraints to ensure correct layering
-            container.add(composePanel, java.lang.Integer(100)) // PALETTE_LAYER
-
-            fun updateBounds() {
-                if (composePanel.width != container.width || composePanel.height != container.height) {
-                    composePanel.setBounds(0, 0, container.width, container.height)
-                    DesktopRuntimeDiagnostics.info("NativePlayerOverlay", "NativePlayerOverlay: bounds updated to ${container.width}x${container.height}")
-                    container.revalidate()
-                    container.repaint()
-                }
-            }
-
-            val listener = object : ComponentAdapter() {
-                override fun componentResized(e: ComponentEvent) = updateBounds()
-                override fun componentMoved(e: ComponentEvent) = updateBounds()
-            }
-
-            container.addComponentListener(listener)
-            updateBounds()
-
-            onDispose {
-                DesktopRuntimeDiagnostics.info("NativePlayerOverlay", "NativePlayerOverlay: Disposing overlay")
-                container.removeComponentListener(listener)
-                container.remove(composePanel)
-                container.revalidate()
-                container.repaint()
-            }
+            onDispose {}
+        }
+        NuvioTheme(
+            appTheme = appThemeState.value,
+            amoled = amoledState.value,
+            darkTheme = darkThemeState.value,
+        ) {
+            contentState.value()
         }
     }
 }
