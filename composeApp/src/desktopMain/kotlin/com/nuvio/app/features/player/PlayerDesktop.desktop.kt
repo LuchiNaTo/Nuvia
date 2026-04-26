@@ -3005,7 +3005,7 @@ private object Win32Window {
         fun SetWindowLongPtr(hWnd: Pointer?, nIndex: Int, dwNewLong: Long): Long
     }
 
-    val user32: User32? = runCatching { Native.load("user32", User32::class.java) as User32 }.getOrNull()
+    private val user32: User32? = runCatching { Native.load("user32", User32::class.java) as User32 }.getOrNull()
 
     fun applyToolWindowStyle(hwnd: Pointer?) {
         val u = user32 ?: return
@@ -3090,6 +3090,26 @@ actual fun NativePlayerOverlay(
     var trackedPosition by remember { mutableStateOf<IntOffset?>(null) }
     var trackedSize by remember { mutableStateOf<IntSize?>(null) }
 
+    // Keep a reference to the overlay AWT window so we can manipulate z-order safely.
+    val awtWindowRef = remember { java.util.concurrent.atomic.AtomicReference<java.awt.Window?>(null) }
+
+    fun raiseOverlayWindow() {
+        val wnd = awtWindowRef.get() ?: return
+        javax.swing.SwingUtilities.invokeLater {
+            runCatching {
+                if (!wnd.isDisplayable || !wnd.isVisible) return@runCatching
+                val prev = wnd.isAlwaysOnTop
+                try {
+                    if (!prev) wnd.isAlwaysOnTop = true
+                    wnd.toFront()
+                } finally {
+                    if (!prev) wnd.isAlwaysOnTop = false
+                }
+                DesktopRuntimeDiagnostics.info("PlayerDesktop", "Overlay raised to front")
+            }
+        }
+    }
+
     DisposableEffect(mainWindow, container) {
         fun refresh() {
             if (!container.isShowing || !mainWindow.isShowing) {
@@ -3110,9 +3130,18 @@ actual fun NativePlayerOverlay(
         }
 
         val componentListener = object : ComponentAdapter() {
-            override fun componentResized(e: ComponentEvent) = refresh()
-            override fun componentMoved(e: ComponentEvent) = refresh()
+            override fun componentResized(e: ComponentEvent) {
+                refresh()
+                raiseOverlayWindow()
+            }
+
+            override fun componentMoved(e: ComponentEvent) {
+                refresh()
+                raiseOverlayWindow()
+            }
+
             override fun componentShown(e: ComponentEvent) = refresh()
+
             override fun componentHidden(e: ComponentEvent) {
                 trackedPosition = null
                 trackedSize = null
@@ -3124,15 +3153,31 @@ actual fun NativePlayerOverlay(
                 trackedPosition = null
                 trackedSize = null
             }
-            override fun windowDeiconified(e: java.awt.event.WindowEvent?) = refresh()
-            override fun windowActivated(e: java.awt.event.WindowEvent?) = refresh()
+
+            override fun windowDeiconified(e: java.awt.event.WindowEvent?) {
+                refresh()
+                raiseOverlayWindow()
+            }
+
+            override fun windowActivated(e: java.awt.event.WindowEvent?) {
+                refresh()
+                raiseOverlayWindow()
+            }
+
+            override fun windowGainedFocus(e: java.awt.event.WindowEvent?) {
+                refresh()
+                raiseOverlayWindow()
+            }
         }
 
         container.addComponentListener(componentListener)
         mainWindow.addComponentListener(componentListener)
         mainFrame?.addWindowListener(windowAdapter)
         mainFrame?.addWindowStateListener(windowAdapter)
-        javax.swing.SwingUtilities.invokeLater { refresh() }
+        javax.swing.SwingUtilities.invokeLater {
+            refresh()
+            raiseOverlayWindow()
+        }
 
         onDispose {
             container.removeComponentListener(componentListener)
@@ -3152,8 +3197,6 @@ actual fun NativePlayerOverlay(
         androidx.compose.ui.unit.DpSize(size.width.toDp(), size.height.toDp())
     }
 
-    val awtWindowRef = remember { java.util.concurrent.atomic.AtomicReference<java.awt.Window?>(null) }
-
     val overlayState = androidx.compose.ui.window.rememberWindowState(
         position = overlayPosition,
         size = overlaySize,
@@ -3171,6 +3214,8 @@ actual fun NativePlayerOverlay(
                 }.onFailure {
                     DesktopRuntimeDiagnostics.warn("PlayerDesktop", "Failed to set overlay bounds", it)
                 }
+                // Ensure overlay is in front after a bounds change.
+                raiseOverlayWindow()
             }
         }
     }
