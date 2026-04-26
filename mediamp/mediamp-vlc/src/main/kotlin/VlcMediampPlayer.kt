@@ -148,7 +148,7 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     private var activeVideoSurface: VideoSurface? = null
 
     @Volatile
-    private var activeVideoSurfaceMode: String = "UNATTACHED"
+    private var activeVideoSurfaceMode: String = SURFACE_MODE_UNATTACHED
 
     private var lastMedia: SeekableInputCallbackMedia? = null // keep referenced so won't be gc'ed
 
@@ -170,10 +170,17 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
 
     @InternalMediampApi
     public fun attachBitmapVideoSurface() {
+        if (activeVideoSurfaceMode == SURFACE_MODE_NATIVE_EMBEDDED_WINDOWS) {
+            VlcRuntimeDiagnostics.info(
+                tag = "VlcMediampPlayer",
+                message = "Skipping callback bitmap attach because native embedded surface is already active. playerId=${Integer.toHexString(System.identityHashCode(player))}",
+            )
+            return
+        }
         val videoSurface = surface.createVideoSurface(mediaPlayerFactory)
         attachVideoSurface(
             videoSurface = videoSurface,
-            mode = "CALLBACK_BITMAP_FALLBACK",
+            mode = SURFACE_MODE_CALLBACK_BITMAP_FALLBACK,
             detail = "surfaceType=${videoSurface::class.qualifiedName}",
         )
     }
@@ -183,7 +190,7 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
         val videoSurface = mediaPlayerFactory.videoSurfaces().newVideoSurface(component)
         attachVideoSurface(
             videoSurface = videoSurface,
-            mode = "NATIVE_EMBEDDED_WINDOWS",
+            mode = SURFACE_MODE_NATIVE_EMBEDDED_WINDOWS,
             detail = "component=${component::class.qualifiedName} size=${component.width}x${component.height}",
         )
     }
@@ -197,11 +204,26 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
         detail: String,
     ) {
         createPlayerLock.withLock {
+            if (activeVideoSurfaceMode == SURFACE_MODE_NATIVE_EMBEDDED_WINDOWS && mode == SURFACE_MODE_CALLBACK_BITMAP_FALLBACK) {
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "Ignoring callback bitmap video surface because native embedded surface is already active. playerId=${Integer.toHexString(System.identityHashCode(player))}",
+                )
+                return
+            }
+
             player.videoSurface().set(videoSurface)
             player.input().enableKeyInputHandling(false)
             player.input().enableMouseInputHandling(false)
             activeVideoSurface = videoSurface
             activeVideoSurfaceMode = mode
+            if (mode == SURFACE_MODE_NATIVE_EMBEDDED_WINDOWS) {
+                surface.clearBitmap()
+                VlcRuntimeDiagnostics.info(
+                    tag = "VlcMediampPlayer",
+                    message = "VLC_NATIVE_SURFACE_SET_ON_PLAYER playerId=${Integer.toHexString(System.identityHashCode(player))} $detail videoSurfaceClass=${videoSurface::class.qualifiedName}",
+                )
+            }
             VlcRuntimeDiagnostics.info(
                 tag = "VlcMediampPlayer",
                 message = "VLC_VIDEO_SURFACE_MODE=$mode playerId=${Integer.toHexString(System.identityHashCode(player))} $detail",
@@ -714,6 +736,10 @@ public class VlcMediampPlayer(parentCoroutineContext: CoroutineContext) :
     }
 
     public companion object {
+        internal const val SURFACE_MODE_UNATTACHED: String = "UNATTACHED"
+        internal const val SURFACE_MODE_CALLBACK_BITMAP_FALLBACK: String = "CALLBACK_BITMAP_FALLBACK"
+        internal const val SURFACE_MODE_NATIVE_EMBEDDED_WINDOWS: String = "NATIVE_EMBEDDED_WINDOWS"
+
         private val createPlayerLock = ReentrantLock() // 如果同时加载可能会 SIGSEGV
 
         public fun prepareLibraries() {

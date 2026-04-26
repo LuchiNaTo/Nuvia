@@ -38,6 +38,9 @@ public fun VlcMediampPlayerSurface(
         FrameSizeCalculator()
     }
     LaunchedEffect(mediampPlayer) {
+        if (mediampPlayer.currentVideoSurfaceMode() == VlcMediampPlayer.SURFACE_MODE_NATIVE_EMBEDDED_WINDOWS) {
+            return@LaunchedEffect
+        }
         mediampPlayer.attachBitmapVideoSurface()
     }
     val aspectRatioMode by mediampPlayer.features[VideoAspectRatio.Key]?.mode?.collectAsState() 
