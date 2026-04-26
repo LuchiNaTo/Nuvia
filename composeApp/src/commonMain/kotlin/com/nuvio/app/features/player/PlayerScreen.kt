@@ -38,6 +38,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -85,6 +86,7 @@ private val playerLog = Logger.withTag("PlayerScreen")
 private val PlayerSliderOverlayGap = 12.dp
 private val PlayerTimeRowHeight = 36.dp
 private val PlayerActionRowHeight = 50.dp
+private val externalBottomHeight = 220.dp
 
 private fun sliderOverlayBottomPadding(metrics: PlayerLayoutMetrics) =
     metrics.sliderBottomOffset +
@@ -1445,7 +1447,7 @@ fun PlayerScreen(
                 .onSizeChanged { layoutSize = it },
         ) {
             val surfaceModifier = if (requiresExternalControls && !usesNativeOverlay)
-                Modifier.fillMaxWidth().height(maxHeight - externalBottomHeight).align(Alignment.TopCenter)
+                Modifier.fillMaxWidth().height(this@BoxWithConstraints.maxHeight - externalBottomHeight).align(Alignment.TopCenter)
             else Modifier.fillMaxSize()
 
             PlatformPlayerSurface(
@@ -1791,6 +1793,7 @@ fun PlayerScreen(
                         }
                     },
             )
+        }
 
             if (!usesNativePlayerChrome && pausedOverlayVisible && !controlsVisible && !playerControlsLocked) {
                 PauseMetadataOverlay(
@@ -1848,8 +1851,12 @@ fun PlayerScreen(
                                 refreshTracks()
                                 showAudioModal = true
                             },
-                            onSourcesClick = if (activeVideoId != null) {{ openSourcesPanel() }} else null,
-                            onEpisodesClick = if (isSeries) {{ openEpisodesPanel() }} else null,
+                            onSourcesClick = if (activeVideoId != null) {
+                                { openSourcesPanel() }
+                            } else null,
+                            onEpisodesClick = if (isSeries) {
+                                { openEpisodesPanel() }
+                            } else null,
                             onScrubChange = { positionMs -> scrubbingPositionMs = positionMs },
                             onScrubFinished = { positionMs ->
                                 scrubbingPositionMs = null
@@ -1893,8 +1900,12 @@ fun PlayerScreen(
                             refreshTracks()
                             showAudioModal = true
                         },
-                        onSourcesClick = if (activeVideoId != null) {{ openSourcesPanel() }} else null,
-                        onEpisodesClick = if (isSeries) {{ openEpisodesPanel() }} else null,
+                        onSourcesClick = if (activeVideoId != null) {
+                            { openSourcesPanel() }
+                        } else null,
+                        onEpisodesClick = if (isSeries) {
+                            { openEpisodesPanel() }
+                        } else null,
                         onScrubChange = { positionMs -> scrubbingPositionMs = positionMs },
                         onScrubFinished = { positionMs ->
                             scrubbingPositionMs = null
@@ -2174,50 +2185,4 @@ fun PlayerScreen(
         }
     }
 }
-
-private fun <T> findPreferredTrackIndex(
-    tracks: List<T>,
-    targets: List<String>,
-    language: (T) -> String?,
-): Int {
-    if (targets.isEmpty()) return -1
-    for (target in targets) {
-        val matchIndex = tracks.indexOfFirst { track ->
-            languageMatchesPreference(
-                trackLanguage = language(track),
-                targetLanguage = target,
-            )
-        }
-        if (matchIndex >= 0) {
-            return matchIndex
-        }
-    }
-    return -1
-}
-
-private fun findPreferredSubtitleTrackIndex(
-    tracks: List<SubtitleTrack>,
-    targets: List<String>,
-): Int {
-    if (targets.isEmpty()) return -1
-
-    for ((targetPosition, target) in targets.withIndex()) {
-        val normalizedTarget = normalizeLanguageCode(target) ?: continue
-        if (normalizedTarget == SubtitleLanguageOption.FORCED) {
-            val forcedIndex = tracks.indexOfFirst { it.isForced }
-            if (forcedIndex >= 0) return forcedIndex
-            if (targetPosition == 0) return -1
-            continue
-        }
-
-        val matchIndex = tracks.indexOfFirst { track ->
-            languageMatchesPreference(
-                trackLanguage = track.language,
-                targetLanguage = normalizedTarget,
-            )
-        }
-        if (matchIndex >= 0) return matchIndex
-    }
-
-    return -1
 }

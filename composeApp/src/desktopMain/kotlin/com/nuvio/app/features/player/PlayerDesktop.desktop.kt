@@ -714,8 +714,6 @@ private fun createWindowsVlcMediaRequest(
     reloadNonce = reloadNonce,
 )
 
-val activeVlcOverlayContainerState = mutableStateOf<JLayeredPane?>(null)
-
 @OptIn(InternalMediampApi::class)
 @Composable
 private fun WindowsVlcPlayerSurface(
